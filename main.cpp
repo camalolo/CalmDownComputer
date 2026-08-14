@@ -88,6 +88,7 @@ enum : UINT {
     IDM_T85     = 2006,
     IDM_T90     = 2007,
     IDM_INF     = 2008,   // ∞ — max power
+    IDM_STARTUP = 2500,   // Start at logon toggle
     IDM_EXIT    = 3000,
 };
 
@@ -322,6 +323,39 @@ static HICON createTempIcon(int temp) {
     return hIcon;
 }
 
+// ───────────────────────── Scheduled task helpers ─────────────────────────
+
+static const char* TASK_NAME = "CalmDownGPU";
+
+// Returns true if the "CalmDownGPU" scheduled task exists.
+static bool isStartupTaskEnabled() {
+    std::string cmd = std::string("schtasks /query /tn ") + TASK_NAME + " /fo csv /nh";
+    auto r = runHidden(cmd.c_str());
+    return r.exitCode == 0;
+}
+
+// Create a logon task that runs this exe elevated.
+static bool createStartupTask() {
+    wchar_t wpath[MAX_PATH];
+    GetModuleFileNameW(nullptr, wpath, MAX_PATH);
+    char path[MAX_PATH];
+    WideCharToMultiByte(CP_UTF8, 0, wpath, -1, path, MAX_PATH, nullptr, nullptr);
+
+    std::string cmd = std::string("schtasks /create /tn ") + TASK_NAME +
+        " /tr \"" + path + "\" /sc onlogon /rl highest /f";
+    auto r = runHidden(cmd.c_str());
+    log("createStartupTask: exit=%lu", r.exitCode);
+    return r.exitCode == 0;
+}
+
+// Delete the logon task.
+static bool deleteStartupTask() {
+    std::string cmd = std::string("schtasks /delete /tn ") + TASK_NAME + " /f";
+    auto r = runHidden(cmd.c_str());
+    log("deleteStartupTask: exit=%lu", r.exitCode);
+    return r.exitCode == 0;
+}
+
 // ───────────────────────── Registry persistence ─────────────────────────
 
 static const wchar_t* REG_KEY = L"Software\\CalmDownGPU";
@@ -550,6 +584,14 @@ static void rebuildMenu() {
     }
 
     AppendMenuW(g_hMenu, MF_SEPARATOR, 0, nullptr);
+
+    // Start at logon toggle.
+    UINT startupFlags = MF_STRING;
+    if (isStartupTaskEnabled())
+        startupFlags |= MF_CHECKED;
+    AppendMenuW(g_hMenu, startupFlags, IDM_STARTUP, L"Start at logon");
+
+    AppendMenuW(g_hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(g_hMenu, MF_STRING, IDM_EXIT, L"Exit");
 }
 
@@ -649,6 +691,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 onTimerTick();
                 return 0;
             }
+        }
+        if (id == IDM_STARTUP) {
+            if (isStartupTaskEnabled())
+                deleteStartupTask();
+            else
+                createStartupTask();
+            return 0;
         }
         if (id == IDM_EXIT) {
             Shell_NotifyIconW(NIM_DELETE, &g_nid);
