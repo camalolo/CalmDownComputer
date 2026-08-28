@@ -1,15 +1,23 @@
-// CalmDownGPU - Windows tray app that regulates GPU temperature via power limiting.
-// Uses nvidia-smi to query temperature and set power limits.
+// CalmDownGPU - Windows tray app that regulates GPU temperature by clock capping.
+// Uses nvidia-smi to query temperature and lock core clocks (-lgc).
 // Build: see CMakeLists.txt
 //
 // Key design decisions:
-// - Single-threaded: everything runs on the UI thread. nvidia-smi calls are fast
-//   (<2s) and the app has no visible window, so brief blocking is acceptable.
-// - Hidden commands: uses CreateProcess with CREATE_NO_WINDOW to avoid console popups.
-// - Control algorithm: weighted-average + proportional steps with:
-//   • Emergency brake: immediate power cut when temp exceeds target by ≥2°C
-//   • Cooldown: 20s settling time after each power change
-//   • Deadband: ±1.5°C — once stable, power stays put
+// - Clock-only control: the card enforces power THROUGH its clock/voltage
+//   curve anyway, and the power-limit domain on driver 595.97 misreports
+//   (N/A ranges, readback that ignores applied limits). Commanding clocks
+//   directly is the same lever without the broken middleman, and the control
+//   loop closes on temperature — the only sensor that never lies.
+// - Two threads: the UI thread only runs control math, logging and the menu;
+//   ALL blocking external work (nvidia-smi calls, tray painting) lives on a
+//   worker thread, so a stalled call can never freeze the app.
+// - Hidden commands: CreateProcess with CREATE_NO_WINDOW; runHidden is
+//   bounded (non-blocking drain + 15s watchdog kill).
+// - Control: 10s ticks, weighted average, ±1.5°C deadband.
+//   • Above target: -30MHz per tick (first engagement -150MHz)
+//   • ≥6°C over target: emergency dive, -150MHz per tick
+//   • Below target: +15MHz only after ~60s of sustained cool
+//   The power limit is left alone (read once at startup, restored on exit).
 
 #ifndef UNICODE
 #define UNICODE
@@ -35,13 +43,16 @@
 #include <cstdio>
 #include <ctime>
 #include <cstdarg>
+#include <mutex>
 
 // ───────────────────────── Logging ─────────────────────────
 
 static char g_logPath[MAX_PATH] = {};
+static std::mutex g_logMutex;   // log() is called from the UI and worker threads
 
 static void log(const char* fmt, ...) {
     if (!g_logPath[0]) return;
+    std::lock_guard<std::mutex> lk(g_logMutex);
     FILE* f = nullptr;
     fopen_s(&f, g_logPath, "a");
     if (!f) return;
@@ -59,15 +70,31 @@ static void log(const char* fmt, ...) {
 }
 
 static void logOpen() {
-    GetTempPathA(MAX_PATH, g_logPath);
-    strcat_s(g_logPath, "CalmDownGPU.log");
-    // Write a session separator.
+    // Log next to the executable — a fixed, predictable location that does
+    // NOT depend on the launching shell's %TEMP% (which varies by how/where
+    // the app is started). Falls back to %TEMP% if the exe dir is read-only.
+    wchar_t modW[MAX_PATH] = L"";
+    GetModuleFileNameW(nullptr, modW, MAX_PATH);
+    std::wstring dirW(modW);
+    auto slash = dirW.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) dirW.erase(slash + 1);
+    dirW += L"CalmDownGPU.log";
+    WideCharToMultiByte(CP_UTF8, 0, dirW.c_str(), -1, g_logPath, MAX_PATH, nullptr, nullptr);
+
     FILE* f = nullptr;
+    if (fopen_s(&f, g_logPath, "a") != 0 || !f) {
+        GetTempPathA(MAX_PATH, g_logPath);
+        strcat_s(g_logPath, "CalmDownGPU.log");
+    } else {
+        fclose(f);
+    }
+    // Write a session separator.
+    f = nullptr;
     if (fopen_s(&f, g_logPath, "a") == 0 && f) {
         fprintf(f, "\n══════════════════════════════════════════\n");
         fclose(f);
-        log("CalmDownGPU starting");
     }
+    log("CalmDownGPU starting → log: %s", g_logPath);
 }
 
 // ───────────────────────── Constants ─────────────────────────
@@ -77,11 +104,17 @@ static void logOpen() {
 #define TIMER_MS         10000       // 10 seconds
 #define HISTORY_LEN      6           // rolling window: 6 × 10s = 60s
 #define DEADBAND_C       1.5         // ±1.5°C: don't adjust within this band
-#define MIN_SAMPLES_EVAL 3           // need at least this many samples before evaluating
-#define COOLDOWN_TICKS   2           // after a power change, skip eval this many ticks (20s settling)
-#define STEP_KP          2.5         // proportional gain: step = |error| × KP
-#define STEP_MIN         5           // minimum step in watts
-#define STEP_MAX         30          // maximum step in watts
+
+// Clock-only control constants. The card enforces power THROUGH clocks
+// anyway; clock caps apply instantly, verify against clocks.sm under load,
+// and give continuous authority all the way down (no 100W floor).
+#define CLOCK_STEP_DOWN        30    // MHz per tick while above target
+#define CLOCK_STEP_DOWN_FIRST  150   // first dive from uncapped: get near the cliff fast
+#define CLOCK_STEP_UP          15    // MHz per restore step (reluctant climb)
+#define CLOCK_COOL_TICKS       6     // consecutive cool ticks before a raise (~60s)
+#define CLOCK_EMERGENCY_STEP   150   // MHz dive per tick when ≥6°C over target
+#define CLOCK_MIN              300   // never cap below this (usability floor)
+#define CLOCK_LOW              210   // low end of the -lgc range (idle clock, MHz)
 
 #define IDI_APP          100
 
@@ -99,6 +132,10 @@ enum : UINT {
     IDM_STARTUP = 2500,   // Start at logon toggle
     IDM_EXIT    = 3000,
 };
+
+// Forward declarations (defined with the worker bridge below).
+static void enqueueCap(int capMhz);          // -1 = restore default clocks
+static void requestTrayRefresh(const std::wstring& tip);
 
 // ───────────────────────── Helpers ─────────────────────────
 
@@ -153,12 +190,36 @@ static ExecResult runHidden(const char* cmd) {
         return res;
     }
 
+    // Non-blocking drain + watchdog. A plain ReadFile loop deadlocks forever
+    // if the child (or a grandchild still holding the pipe write-end) hangs —
+    // e.g. nvidia-smi stalling under GPU load — which freezes the UI thread.
+    const DWORD t0 = GetTickCount();
     char chunk[512];
-    DWORD n = 0;
-    while (ReadFile(hRead, chunk, sizeof(chunk), &n, nullptr) && n > 0)
+    DWORD avail = 0, n = 0;
+    bool childDone = false;
+    for (;;) {
+        // Drain whatever is available right now (PeekNamedPipe never blocks).
+        while (PeekNamedPipe(hRead, nullptr, 0, nullptr, &avail, nullptr) && avail > 0) {
+            if (!ReadFile(hRead, chunk, std::min(avail, (DWORD)sizeof(chunk)), &n, nullptr) || n == 0)
+                break;
+            res.output.append(chunk, n);
+        }
+        DWORD dw = WaitForSingleObject(pi.hProcess, 100);
+        if (dw == WAIT_OBJECT_0) { childDone = true; break; }      // child exited
+        if (dw != WAIT_TIMEOUT) break;                              // wait failed
+        if (GetTickCount() - t0 >= 15000) {                         // watchdog
+            TerminateProcess(pi.hProcess, 1);
+            log("runHidden: watchdog killed hung process (%.30s)", cmd);
+            break;
+        }
+    }
+    // Final drain after the child exited (EOF arrived): collect leftovers.
+    while (PeekNamedPipe(hRead, nullptr, 0, nullptr, &avail, nullptr) && avail > 0) {
+        if (!ReadFile(hRead, chunk, std::min(avail, (DWORD)sizeof(chunk)), &n, nullptr) || n == 0)
+            break;
         res.output.append(chunk, n);
-
-    WaitForSingleObject(pi.hProcess, 15000);
+    }
+    (void)childDone;
     GetExitCodeProcess(pi.hProcess, &res.exitCode);
 
     CloseHandle(pi.hProcess);
@@ -185,7 +246,8 @@ static int queryTemp() {
     catch (...) { log("queryTemp: parse failed: %s", s.c_str()); return -1; }
 }
 
-// Returns watts, or -1 on failure.
+// Returns watts, or -1 on failure. Only used at startup to learn the current
+// limit (restored on exit) — never for regulation.
 static int queryPowerLimit() {
     auto r = runHidden("nvidia-smi --query-gpu=power.limit --format=csv,noheader,nounits -i 0");
     auto s = trim(r.output);
@@ -194,20 +256,8 @@ static int queryPowerLimit() {
     catch (...) { return -1; }
 }
 
-// Returns {minWatts, maxWatts}; falls back to {100, 400} on failure.
-static std::pair<int,int> queryPowerRange() {
-    auto r = runHidden(
-        "nvidia-smi --query-gpu=power.min_limit,power.max_limit "
-        "--format=csv,noheader,nounits -i 0");
-    auto s = trim(r.output);
-    float lo = 0, hi = 0;
-    // Output looks like "100.00, 270.00"
-    if (sscanf_s(s.c_str(), "%f, %f", &lo, &hi) == 2 && hi > 0)
-        return { static_cast<int>(lo), static_cast<int>(hi) };
-    return { 100, 400 };
-}
-
-// Set power limit. Returns true on success.
+// Set power limit. Returns true on success. Only used for the startup-
+// read/exit-restore parity — regulation never touches power.
 static bool setPowerLimit(int watts) {
     std::string cmd = "nvidia-smi -pl " + std::to_string(watts) + " -i 0";
     auto r = runHidden(cmd.c_str());
@@ -222,6 +272,36 @@ static bool setPowerLimit(int watts) {
 static std::string queryGpuName() {
     auto r = runHidden("nvidia-smi --query-gpu=name --format=csv,noheader -i 0");
     return trim(r.output);
+}
+
+// Returns max SM clock in MHz, or 0 if unavailable.
+static int queryMaxClock() {
+    auto r = runHidden("nvidia-smi --query-gpu=clocks.max.sm --format=csv,noheader,nounits -i 0");
+    auto s = trim(r.output);
+    if (s.empty()) return 0;
+    try { int c = std::stoi(s); return c > 0 ? c : 0; }
+    catch (...) { return 0; }
+}
+
+// Cap core clocks to [CLOCK_LOW, capMhz]. Returns true on success.
+static bool setClockCap(int capMhz) {
+    std::string cmd = "nvidia-smi -lgc " + std::to_string(CLOCK_LOW) + "," +
+                      std::to_string(capMhz) + " -i 0";
+    auto r = runHidden(cmd.c_str());
+    bool ok = (r.exitCode == 0);
+    if (ok) log("setClockCap: %dMHz OK", capMhz);
+    else    log("setClockCap: %dMHz FAILED (exit=%lu) %s", capMhz, r.exitCode,
+                trim(r.output).c_str());
+    return ok;
+}
+
+// Restore default clocks. Returns true on success.
+static bool resetClocks() {
+    auto r = runHidden("nvidia-smi -rgc -i 0");
+    bool ok = (r.exitCode == 0);
+    if (ok) log("resetClocks: OK");
+    else    log("resetClocks: FAILED (exit=%lu)", r.exitCode);
+    return ok;
 }
 
 // ───────────────────────── Dynamic tray icon ─────────────────────────
@@ -395,21 +475,21 @@ static int loadTargetTemp() {
 //
 // Regulation loop (every TIMER_MS):
 //   1. Read GPU temperature.
-//   2. Push into rolling history (kept across power changes — old data ages out naturally).
-//   3. If history has enough samples AND average is outside the deadband,
-//      compute a proportional step and apply it via nvidia-smi.
-//   A cooldown timer prevents evaluating too soon after a change (thermal lag).
+//   2. Push into rolling history (kept across cap changes — old data ages
+//      out naturally).
+//   3. Steer the clock cap: dive while hot (every tick), climb reluctantly
+//      after sustained cool, hold inside the deadband. See regulateTick().
 
 struct Controller {
-    int  targetTemp    = 0;     // 0 = off, -1 = max power, >0 = target °C
-    int  powerMin      = 100;   // watts
-    int  powerMax      = 400;
-    int  currentPower  = 150;   // last-known applied power limit
+    int  targetTemp = 0;      // 0 = off, -1 = uncapped (∞), >0 = target °C
 
     std::deque<int> history;
-    int  cooldown      = 0;     // ticks to skip after a power change
+    int  maxClock  = 0;       // GPU max SM clock (MHz); 0 = unknown → control disabled
+    int  capMhz    = 0;       // last CONFIRMED cap; 0 = uncapped (updated from capDone)
+    int  coolTicks = 0;       // consecutive ticks comfortably below target
+    int  settle    = 0;       // ticks to hold after a cap change (thermal lag ~15-20s)
 
-    void reset() { history.clear(); cooldown = 0; }
+    void reset() { history.clear(); coolTicks = 0; settle = 0; }
 
     bool isActive() const { return targetTemp > 0; }
 
@@ -439,63 +519,22 @@ struct Controller {
         return history.empty() ? 0 : history.back();
     }
 
-    // Immediate safety brake: if the latest reading exceeds the target,
-    // cut power immediately without waiting for cooldown or enough samples.
-    // Returns new power or -1 if no change.
-    int emergencyBrake() {
-        if (!isActive()) return -1;
-        if (history.empty()) return -1;
-        int cur = latest();
-        int overshoot = cur - targetTemp;
-        if (overshoot < 2) return -1;  // only brake on significant overshoot
-
-        int step = std::max(STEP_MIN, overshoot * 3);
-        step = std::min(step, STEP_MAX);
-        int next = currentPower - step;
-        next = std::max(powerMin, next);
-        if (next >= currentPower) return -1;
-        log("BRAKE: temp=%d overshoot=%d → step=%dW → power %dW → %dW",
-            cur, overshoot, step, currentPower, next);
-        cooldown = COOLDOWN_TICKS;
-        return next;
-    }
-
-    // Returns the new power to apply, or -1 if no change is needed.
-    int evaluate() {
-        if (!isActive())                   return -1;
-        if ((int)history.size() < MIN_SAMPLES_EVAL) return -1;
-        if (cooldown > 0) {
-            cooldown--;
-            log("eval: cooldown active (%d ticks left), skipping", cooldown + 1);
-            return -1;
-        }
-
+    // Sensing value used for control: midpoint between weighted average and the
+    // latest reading when climbing (reacts fast), plain average when falling.
+    double effective() const {
         double avg = weightedAvg();
         int    cur = latest();
-        // Use the higher of weighted-avg and latest reading so we react
-        // quickly when temps are climbing, and vice-versa when dropping.
-        double effective = (cur > avg) ? (avg + cur) / 2.0 : avg;
-        double error = effective - static_cast<double>(targetTemp);
+        return (cur > avg) ? (avg + cur) / 2.0 : avg;
+    }
 
-        // Deadband — temperature is close enough; leave power alone.
-        if (std::abs(error) <= DEADBAND_C) {
-            log("eval: eff=%.1f (avg=%.1f cur=%d) target=%d error=%+.1f → deadband, no change (power=%dW)",
-                effective, avg, cur, targetTemp, error, currentPower);
-            return -1;
-        }
-
-        // Proportional step: bigger corrections when far off, smaller when close.
-        int step = static_cast<int>(std::abs(error) * STEP_KP);
-        step = std::max(STEP_MIN, std::min(STEP_MAX, step));
-
-        int next = currentPower + (error > 0 ? -step : step);
-        next = std::max(powerMin, std::min(powerMax, next));
-
-        if (next == currentPower) return -1;
-        log("eval: eff=%.1f (avg=%.1f cur=%d) target=%d error=%+.1f → step=%dW → power %dW → %dW",
-            effective, avg, cur, targetTemp, error, step, currentPower, next);
-        cooldown = COOLDOWN_TICKS;
-        return next;
+    // Command a new cap (0 = restore defaults via -rgc). The worker applies
+    // it; the UI tick updates capMhz from the confirmed result (capDone), so
+    // capMhz always reflects the last KNOWN-good state.
+    void setCap(int mhz) {
+        int old = (capMhz > 0) ? capMhz : maxClock;
+        settle = 2;   // never act again until the cap's thermal effect is visible
+        if (mhz > 0) { enqueueCap(mhz); log("clock: %d → %dMHz", old, mhz); }
+        else         { enqueueCap(-1);  log("clock: %d → uncapped (-rgc)", old); }
     }
 };
 
@@ -509,23 +548,43 @@ static Controller      g_ctrl{};
 static std::string     g_gpuName;
 static int             g_lastTemp = -1;
 
+// ───────────────────────── Worker-thread bridge ─────────────────────────
+// All nvidia-smi and tray/shell calls run on a worker thread: a stalled
+// external call (hung nvidia-smi, wedged explorer tray) can never freeze
+// the UI thread. runHidden is bounded, and the UI just reads the latest
+// published readings.
+struct SharedState {
+    volatile int  temp         = -1;    // worker → UI: last temperature
+    volatile int  defaultPower = 0;     // worker → UI: power limit found at startup (exit restore)
+    volatile int  pendingCap   = 0;     // UI → worker: -1 reset, >0 cap, 0 none
+    volatile int  capDone      = 0;     // worker → UI: -1 restored, >0 applied, <0 failed
+    volatile int  maxClock     = 0;
+    volatile bool initDone     = false;
+    volatile bool trayDirty    = false;
+    wchar_t       trayTip[128]{};
+    std::string   gpuName;
+};
+static SharedState      g_shared;
+static CRITICAL_SECTION g_cs;
+static HANDLE           g_worker    = nullptr;
+static HANDLE           g_quitEvent = nullptr;
+
+static void enqueueCap(int capMhz) {   // -1 = restore default clocks
+    EnterCriticalSection(&g_cs);
+    g_shared.pendingCap = capMhz;
+    LeaveCriticalSection(&g_cs);
+}
+
+static void requestTrayRefresh(const std::wstring& tip) {
+    EnterCriticalSection(&g_cs);
+    wcsncpy_s(g_shared.trayTip, tip.c_str(), _TRUNCATE);
+    g_shared.trayDirty = true;
+    LeaveCriticalSection(&g_cs);
+}
+
 // ───────────────────────── Tray icon management ─────────────────────────
-
-static void setTrayIcon(int temp) {
-    HICON hNew = createTempIcon(temp);
-    if (!hNew) return;
-
-    g_nid.hIcon = hNew;
-    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
-
-    if (g_hIcon) DestroyIcon(g_hIcon);
-    g_hIcon = hNew;
-}
-
-static void setTrayTip(const std::wstring& tip) {
-    wcsncpy_s(g_nid.szTip, tip.c_str(), _TRUNCATE);
-    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
-}
+// Icon creation + Shell_NotifyIcon are worker-owned (they can block on a
+// wedged explorer). The UI only requests a refresh via requestTrayRefresh().
 
 // ───────────────────────── Menu ─────────────────────────
 
@@ -567,8 +626,8 @@ static std::wstring buildTipText() {
     }
     s += L"\nTemp: ";
     s += (g_lastTemp >= 0) ? std::to_wstring(g_lastTemp) + L"\u00B0C" : L"--";
-    s += L"  |  Power: ";
-    s += std::to_wstring(g_ctrl.currentPower) + L"W";
+    s += L"\nClock cap: ";
+    s += (g_ctrl.capMhz > 0) ? std::to_wstring(g_ctrl.capMhz) + L" MHz" : L"none";
     s += L"\nTarget: " + targetLabel();
     if (g_ctrl.isActive() && !g_ctrl.history.empty())
         s += L"  (avg " + std::to_wstring(static_cast<int>(g_ctrl.weightedAvg())) + L"\u00B0C)";
@@ -620,47 +679,184 @@ static void showContextMenu(HWND hwnd) {
 
 // ───────────────────────── Timer handler ─────────────────────────
 
-static void onTimerTick() {
-    int temp = queryTemp();
-    g_lastTemp = temp;
-    log("tick: temp=%d target=%d power=%dW", temp, g_ctrl.targetTemp, g_ctrl.currentPower);
+// Clock-only regulation. Called every tick with a fresh temperature sample.
+//   - ≥6°C over target:        emergency dive, -150MHz per tick, no gating
+//   - above target + deadband: steady dive, -30MHz per tick
+//                              (first engagement from uncapped: -150MHz)
+//   - below target - deadband: after CLOCK_COOL_TICKS consecutive cool ticks
+//                              +15MHz; fully recovered → -rgc
+//   - inside deadband:         hold (the climb counter resets — climbing
+//                              requires SUSTAINED cold, not borderline cold)
+static void regulateTick() {
+    if (!g_ctrl.isActive()) return;
+    if (g_ctrl.maxClock <= 0) return;   // clock control unavailable
 
-    // Always update display.
-    setTrayIcon(temp);
-    setTrayTip(buildTipText());
+    // Settle window: a cap needs ~15-20s to show its thermal effect.
+    // Deciding on pre-effect temperatures caused the 1800MHz overreaction.
+    if (g_ctrl.settle > 0) {
+        g_ctrl.settle--;
+        log("eval: settle (%d ticks left) — letting the cap take effect", g_ctrl.settle);
+        return;
+    }
+
+    double eff    = g_ctrl.effective();
+    double target = static_cast<double>(g_ctrl.targetTemp);
+    int    cur    = g_ctrl.latest();
+
+    // Emergency dive.
+    if (cur >= target + 6) {
+        int newCap = (g_ctrl.capMhz > 0 ? g_ctrl.capMhz : g_ctrl.maxClock) - CLOCK_EMERGENCY_STEP;
+        newCap = std::max(CLOCK_MIN, newCap);
+        if (g_ctrl.capMhz <= 0 || newCap < g_ctrl.capMhz) g_ctrl.setCap(newCap);
+        return;
+    }
+
+    // Too hot: steady dive, every tick.
+    if (eff > target + DEADBAND_C) {
+        g_ctrl.coolTicks = 0;
+        int base = (g_ctrl.capMhz > 0) ? g_ctrl.capMhz : g_ctrl.maxClock;
+        int step = (g_ctrl.capMhz > 0) ? CLOCK_STEP_DOWN : CLOCK_STEP_DOWN_FIRST;
+        int newCap = std::max(CLOCK_MIN, base - step);
+        if (g_ctrl.capMhz <= 0 || newCap < g_ctrl.capMhz) g_ctrl.setCap(newCap);
+        return;
+    }
+
+    // Too cool: reluctant climb after sustained cool.
+    if (eff < target - DEADBAND_C) {
+        if (++g_ctrl.coolTicks < CLOCK_COOL_TICKS) return;
+        g_ctrl.coolTicks = 0;
+        if (g_ctrl.capMhz <= 0) return;   // nothing to restore
+        int newCap = g_ctrl.capMhz + CLOCK_STEP_UP;
+        g_ctrl.setCap(newCap >= g_ctrl.maxClock ? 0 : newCap);
+        return;
+    }
+
+    // Deadband: hold, and require fresh sustained cold before climbing.
+    g_ctrl.coolTicks = 0;
+}
+
+// ───────────────────────── Worker thread ─────────────────────────
+// Owns every blocking external call: nvidia-smi queries/commands and tray
+// painting. The UI thread never blocks on the outside world.
+static DWORD WINAPI workerMain(LPVOID) {
+    // --- Startup discovery ---
+    std::string name = queryGpuName();
+    int mclk = queryMaxClock();
+    int pl   = queryPowerLimit();   // informational; never regulated, restored on exit
+    {
+        EnterCriticalSection(&g_cs);
+        g_shared.gpuName      = name;
+        g_shared.maxClock     = mclk;
+        g_shared.defaultPower = (pl > 0) ? pl : 270;
+        g_shared.initDone     = true;
+        LeaveCriticalSection(&g_cs);
+    }
+    g_gpuName = name;
+    log("GPU: %s", name.c_str());
+    log("Power limit at startup: %dW (left alone; restored on exit)", g_shared.defaultPower);
+    log("Max SM clock: %sMHz", mclk > 0 ? std::to_string(mclk).c_str() : "unavailable — clock control disabled");
+
+    // Establish a known-uncapped state: any leftover/manual -lgc lock would
+    // make "cap=none" a lie and the first dive could land above the real cap.
+    resetClocks();
+
+    HICON lastIcon = nullptr;
+    while (WaitForSingleObject(g_quitEvent, 0) != WAIT_OBJECT_0) {
+        int temp = queryTemp();
+
+        // Pick up commands from the UI.
+        int pendC = 0;
+        {
+            EnterCriticalSection(&g_cs);
+            pendC = g_shared.pendingCap;   g_shared.pendingCap = 0;
+            LeaveCriticalSection(&g_cs);
+        }
+        if (pendC == -1) {
+            resetClocks();
+            EnterCriticalSection(&g_cs); g_shared.capDone = -1; LeaveCriticalSection(&g_cs);
+        } else if (pendC > 0) {
+            if (setClockCap(pendC)) {
+                EnterCriticalSection(&g_cs); g_shared.capDone = pendC; LeaveCriticalSection(&g_cs);
+            } else {
+                EnterCriticalSection(&g_cs); g_shared.capDone = -pendC; LeaveCriticalSection(&g_cs);  // negative = failed
+            }
+        }
+        // Publish readings for the UI tick.
+        {
+            EnterCriticalSection(&g_cs);
+            g_shared.temp = temp;
+            LeaveCriticalSection(&g_cs);
+        }
+
+        // Tray refresh (Shell_NotifyIcon can block on a wedged explorer).
+        bool tray = false;
+        wchar_t tip[128] = L"";
+        {
+            EnterCriticalSection(&g_cs);
+            tray = g_shared.trayDirty;
+            if (tray) wcsncpy_s(tip, g_shared.trayTip, _TRUNCATE);
+            LeaveCriticalSection(&g_cs);
+        }
+        if (tray) {
+            HICON h = createTempIcon(temp);
+            if (h) {
+                if (tip[0]) wcsncpy_s(g_nid.szTip, tip, _TRUNCATE);
+                g_nid.hIcon = h;
+                Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+                if (lastIcon) DestroyIcon(lastIcon);
+                lastIcon = h;
+            }
+            EnterCriticalSection(&g_cs); g_shared.trayDirty = false; LeaveCriticalSection(&g_cs);
+        }
+        Sleep(200);   // light pacing; the queries above take ~0.5-1s themselves
+    }
+    return 0;
+}
+
+static void onTimerTick() {
+    // Snapshot the worker's latest readings.
+    int temp;
+    {
+        EnterCriticalSection(&g_cs);
+        temp = g_shared.temp;
+        LeaveCriticalSection(&g_cs);
+    }
+    if (!g_shared.initDone) { log("tick: waiting for GPU discovery"); return; }
+
+    g_lastTemp = temp;
+    g_ctrl.maxClock = g_shared.maxClock;
+    std::string capS = (g_ctrl.capMhz > 0) ? std::to_string(g_ctrl.capMhz) + "MHz" : "none";
+    log("tick: temp=%d target=%d cap=%s", temp, g_ctrl.targetTemp, capS.c_str());
+
+    // Apply the worker's confirmed clock-cap result.
+    int done;
+    {
+        EnterCriticalSection(&g_cs);
+        done = g_shared.capDone;
+        g_shared.capDone = 0;
+        LeaveCriticalSection(&g_cs);
+    }
+    if (done == -1)      { g_ctrl.capMhz = 0; log("clock: restored defaults"); }
+    else if (done > 0)   g_ctrl.capMhz = done;
+    else if (done < -1)  log("clock: cap %dMHz FAILED — keeping previous state", -done);
+
+    // Display refresh is painted by the worker.
+    requestTrayRefresh(buildTipText());
 
     if (temp < 0) {
         log("tick: failed to read temperature");
         return;  // can't regulate without valid readings
     }
 
-    // ∞ mode: push power to max once.
-    if (g_ctrl.targetTemp == -1) {
-        if (g_ctrl.currentPower != g_ctrl.powerMax) {
-            if (setPowerLimit(g_ctrl.powerMax))
-                g_ctrl.currentPower = g_ctrl.powerMax;
-        }
+    // ∞ / Off: make sure clocks are uncapped, then there is nothing to do.
+    if (g_ctrl.targetTemp <= 0) {
+        if (g_ctrl.capMhz > 0) g_ctrl.setCap(0);
         return;
     }
 
-    // Active regulation.
-    if (g_ctrl.isActive()) {
-        g_ctrl.addSample(temp);
-
-        // Immediate brake if over target — bypasses cooldown.
-        int next = g_ctrl.emergencyBrake();
-
-        // Normal proportional control if no brake was needed.
-        if (next < 0)
-            next = g_ctrl.evaluate();
-
-        if (next >= 0) {
-            if (setPowerLimit(next)) {
-                g_ctrl.currentPower = next;
-                log("tick: power changed to %dW", next);
-            }
-        }
-    }
+    // Active regulation (clock-only).
+    g_ctrl.addSample(temp);
+    regulateTick();
 }
 
 // ───────────────────────── Window procedure ─────────────────────────
@@ -688,12 +884,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 log("menu: target set to %s", p.temp == -1 ? "INF" :
                     p.temp == 0 ? "OFF" : std::to_string(p.temp).c_str());
 
-                if (p.temp == -1) {
-                    // Infinity — immediately max out power.
-                    if (setPowerLimit(g_ctrl.powerMax))
-                        g_ctrl.currentPower = g_ctrl.powerMax;
-                } else if (p.temp == 0) {
-                    // Off — stop regulating, leave power as-is.
+                if (p.temp <= 0 && g_ctrl.capMhz > 0) {
+                    // ∞ / Off — full clocks again (power is never touched).
+                    g_ctrl.setCap(0);
                 }
                 // Force an immediate reading for instant feedback.
                 onTimerTick();
@@ -708,8 +901,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (id == IDM_EXIT) {
+            // Restore synchronously so it lands even if the worker is gone.
+            resetClocks();
+            setPowerLimit(g_shared.defaultPower > 0 ? g_shared.defaultPower : 270);
             Shell_NotifyIconW(NIM_DELETE, &g_nid);
-            if (g_hIcon) DestroyIcon(g_hIcon);
             PostQuitMessage(0);
         }
         break;
@@ -737,18 +932,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
 
     logOpen();
 
-    // --- Query GPU info on startup ---
-    g_gpuName = queryGpuName();
-    log("GPU: %s", g_gpuName.c_str());
-
-    auto [lo, hi] = queryPowerRange();
-    g_ctrl.powerMin = lo;
-    g_ctrl.powerMax = hi;
-    log("Power range: %d-%dW", lo, hi);
-
-    int pl = queryPowerLimit();
-    g_ctrl.currentPower = (pl > 0) ? pl : hi;
-    log("Current power limit: %dW", g_ctrl.currentPower);
+    // Worker thread owns all nvidia-smi + tray work (see workerMain).
+    InitializeCriticalSection(&g_cs);
+    g_quitEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);   // manual-reset
+    g_worker = CreateThread(nullptr, 0, workerMain, nullptr, 0, nullptr);
 
     // --- Restore last target ---
     g_ctrl.targetTemp = loadTargetTemp();
@@ -799,6 +986,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         DispatchMessageW(&msg);
     }
 
+    // Shutdown: stop the worker, then leave.
+    SetEvent(g_quitEvent);
+    if (g_worker) { WaitForSingleObject(g_worker, 3000); CloseHandle(g_worker); }
+    CloseHandle(g_quitEvent);
+    DeleteCriticalSection(&g_cs);
     if (hMutex) CloseHandle(hMutex);
     log("CalmDownGPU exiting");
     return 0;
