@@ -1,5 +1,8 @@
 #include <windows.h>
 
+#define IDI_APP 100
+IDI_APP ICON "app.ico"
+
 1 24 "app.manifest"
 
 VS_VERSION_INFO VERSIONINFO

@@ -963,7 +963,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     g_nid.uID    = IDI_APP;
     g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
-    g_nid.hIcon  = createTempIcon(-1);  // placeholder
+    // Branded icon until the first temperature reading arrives (worker takes
+    // over with the dynamic temp icon). LoadIcon returns a shared icon — do
+    // not destroy.
+    g_nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP));
+    if (!g_nid.hIcon) g_nid.hIcon = createTempIcon(-1);
     wcscpy_s(g_nid.szTip, L"CalmDownGPU — starting…");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
