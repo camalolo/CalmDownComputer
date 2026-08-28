@@ -75,12 +75,19 @@ updated only from confirmed results.
 
 **Regulation (`regulateTick`)**, 10s ticks, history of 6 samples, weighted
 average (newer weighs more), effective = midpoint(avg, latest) when climbing
-else avg, deadband ±1.5°C:
-- ≥6°C over target: emergency dive −150MHz/tick (no gating)
-- above target+deadband: −30MHz/tick (first engagement from uncapped: −150MHz)
-- below target−deadband: after 6 consecutive cool ticks, +15MHz; fully
-  recovered → `-rgc`
+else avg, deadband ±1.5°C, steps PROPORTIONAL to the error:
+- over target+deadband: dive err×10MHz per step, clamped 15–150MHz (the
+  emergency dive is just the clamp max — no separate rule)
+- under target−deadband: after 4 consecutive cool ticks, climb err×5MHz
+  clamped 15–30MHz; fully recovered → `-rgc`
 - inside deadband: hold; coolTicks resets (climb needs sustained cold)
+- after ANY cap change: settle 1 tick (2 for ≥90MHz steps) so the next
+  decision uses post-effect temperatures
+- Voltage-cliff learning: a climb step that raises temp ≥5°C (CLIFF_RISE_C)
+  marks the pre-climb cap as `cliffMhz`; later climbs approach but never
+  cross it (tooltip shows "cliff X MHz", reset on preset change). A target
+  that falls inside a V/F gap is unreachable — parking at the cliff is the
+  optimum (max clocks, coolest stable temp).
 
 Key plumbing:
 - `runHidden()` — only way external commands run (`nvidia-smi`, `schtasks`).
@@ -93,8 +100,9 @@ Key plumbing:
 ## Conventions
 
 - Tuning constants are `#define`s at the top of `main.cpp` (~line 100):
-  `HISTORY_LEN`, `DEADBAND_C`, `CLOCK_STEP_DOWN(_FIRST)`, `CLOCK_STEP_UP`,
-  `CLOCK_COOL_TICKS`, `CLOCK_EMERGENCY_STEP`, `CLOCK_MIN`, `CLOCK_LOW`.
+  `HISTORY_LEN`, `DEADBAND_C`, `CLOCK_KP`, `CLOCK_STEP_MIN/MAX`,
+  `CLOCK_KP_UP`, `CLOCK_STEP_UP_MAX`, `CLOCK_COOL_TICKS`, `CLOCK_MIN`,
+  `CLOCK_LOW`.
 - Menu presets are table-driven: `g_presets` + `IDM_*` drive both menu
   building and `WM_COMMAND` dispatch. Extend the table, not if-branches.
 - Unicode split: UI is wide (`wWinMain`, `*W` APIs, `std::wstring`);
@@ -113,6 +121,9 @@ Key plumbing:
 - Cooler is the hardware bottleneck: even ~100W reaches ~85°C under full
   load (fan 100%). Only clock capping gets below that; don't diagnose the
   card's ceiling as a controller bug.
+- **Voltage cliff on this card:** ~1906MHz runs ~65°C while 1934MHz runs
+  ~80°C under the same load — a V/F voltage step. The controller learns the
+  edge and parks below it.
 - **Manifest duplication hazard:** manifest embedded via `resource.rc`
   (`1 24 "app.manifest"`), linker auto-manifest suppressed with
   `/MANIFEST:NO`. Don't add another manifest source.

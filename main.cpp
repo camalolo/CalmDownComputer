@@ -14,9 +14,9 @@
 // - Hidden commands: CreateProcess with CREATE_NO_WINDOW; runHidden is
 //   bounded (non-blocking drain + 15s watchdog kill).
 // - Control: 10s ticks, weighted average, ±1.5°C deadband.
-//   • Above target: -30MHz per tick (first engagement -150MHz)
-//   • ≥6°C over target: emergency dive, -150MHz per tick
-//   • Below target: +15MHz only after ~60s of sustained cool
+//   • Above target: proportional dive — 10MHz per °C over, 15–150MHz steps
+//   • Below target: climb 15–30MHz after ~40s of sustained cool
+//   • 10–20s settle window after each change (decisions use post-effect temps)
 //   The power limit is left alone (read once at startup, restored on exit).
 
 #ifndef UNICODE
@@ -108,13 +108,18 @@ static void logOpen() {
 // Clock-only control constants. The card enforces power THROUGH clocks
 // anyway; clock caps apply instantly, verify against clocks.sm under load,
 // and give continuous authority all the way down (no 100W floor).
-#define CLOCK_STEP_DOWN        30    // MHz per tick while above target
-#define CLOCK_STEP_DOWN_FIRST  150   // first dive from uncapped: get near the cliff fast
-#define CLOCK_STEP_UP          15    // MHz per restore step (reluctant climb)
-#define CLOCK_COOL_TICKS       6     // consecutive cool ticks before a raise (~60s)
-#define CLOCK_EMERGENCY_STEP   150   // MHz dive per tick when ≥6°C over target
-#define CLOCK_MIN              300   // never cap below this (usability floor)
-#define CLOCK_LOW              210   // low end of the -lgc range (idle clock, MHz)
+// Steps are PROPORTIONAL to the error: fine adjustments near the target
+// (15MHz ≈ the ±1.5°C deadband in thermal effect), hard dives when far.
+// There is no separate "emergency" — it is just the clamp maximum.
+#define CLOCK_KP          10    // MHz of dive per °C over target
+#define CLOCK_STEP_MIN    15    // smallest adjustment (matches the deadband)
+#define CLOCK_STEP_MAX    150   // single-step dive limit (= former emergency)
+#define CLOCK_KP_UP        5    // MHz of climb per °C under target (half as eager)
+#define CLOCK_STEP_UP_MAX 30    // single-step climb limit
+#define CLOCK_COOL_TICKS   4    // consecutive cool ticks before a climb (~40s)
+#define CLIFF_RISE_C       5    // temp rise from one climb step = voltage cliff
+#define CLOCK_MIN        300    // never cap below this (usability floor)
+#define CLOCK_LOW        210    // low end of the -lgc range (idle clock, MHz)
 
 #define IDI_APP          100
 
@@ -489,7 +494,15 @@ struct Controller {
     int  coolTicks = 0;       // consecutive ticks comfortably below target
     int  settle    = 0;       // ticks to hold after a cap change (thermal lag ~15-20s)
 
-    void reset() { history.clear(); coolTicks = 0; settle = 0; }
+    // Voltage-cliff learning: on this card, ~1906MHz runs ~65°C while 1934MHz
+    // runs ~80°C — a V/F curve voltage step. Above cliffMhz the temp explodes.
+    int  cliffMhz      = 0;   // learned cap ceiling (0 = unknown)
+    int  climbFromCap  = 0;   // cap before the pending climb (cliff detection)
+    int  climbFromTemp = 0;   // temp before the pending climb
+    int  climbChecks   = 0;   // evals since the pending climb
+
+    void reset() { history.clear(); coolTicks = 0; settle = 0;
+                   cliffMhz = 0; climbFromCap = 0; climbFromTemp = 0; climbChecks = 0; }
 
     bool isActive() const { return targetTemp > 0; }
 
@@ -531,10 +544,11 @@ struct Controller {
     // it; the UI tick updates capMhz from the confirmed result (capDone), so
     // capMhz always reflects the last KNOWN-good state.
     void setCap(int mhz) {
-        int old = (capMhz > 0) ? capMhz : maxClock;
-        settle = 2;   // never act again until the cap's thermal effect is visible
-        if (mhz > 0) { enqueueCap(mhz); log("clock: %d → %dMHz", old, mhz); }
-        else         { enqueueCap(-1);  log("clock: %d → uncapped (-rgc)", old); }
+        int now = (capMhz > 0) ? capMhz : maxClock;
+        int moved = std::abs(now - mhz);
+        settle = (moved >= 90) ? 2 : 1;   // big dives need the long window
+        if (mhz > 0) { enqueueCap(mhz); log("clock: %d → %dMHz (step %d)", now, mhz, moved); }
+        else         { enqueueCap(-1);  log("clock: %d → uncapped (-rgc)", now); }
     }
 };
 
@@ -628,6 +642,8 @@ static std::wstring buildTipText() {
     s += (g_lastTemp >= 0) ? std::to_wstring(g_lastTemp) + L"\u00B0C" : L"--";
     s += L"\nClock cap: ";
     s += (g_ctrl.capMhz > 0) ? std::to_wstring(g_ctrl.capMhz) + L" MHz" : L"none";
+    if (g_ctrl.cliffMhz > 0)
+        s += L"  (cliff " + std::to_wstring(g_ctrl.cliffMhz) + L" MHz)";
     s += L"\nTarget: " + targetLabel();
     if (g_ctrl.isActive() && !g_ctrl.history.empty())
         s += L"  (avg " + std::to_wstring(static_cast<int>(g_ctrl.weightedAvg())) + L"\u00B0C)";
@@ -680,13 +696,14 @@ static void showContextMenu(HWND hwnd) {
 // ───────────────────────── Timer handler ─────────────────────────
 
 // Clock-only regulation. Called every tick with a fresh temperature sample.
-//   - ≥6°C over target:        emergency dive, -150MHz per tick, no gating
-//   - above target + deadband: steady dive, -30MHz per tick
-//                              (first engagement from uncapped: -150MHz)
-//   - below target - deadband: after CLOCK_COOL_TICKS consecutive cool ticks
-//                              +15MHz; fully recovered → -rgc
+//   - above target + deadband: proportional dive, err×10MHz clamped 15–150
+//                              (the emergency dive is just the clamp max)
+//   - below target - deadband: after CLOCK_COOL_TICKS consecutive cool ticks,
+//                              climb err×5MHz clamped 15–30; fully recovered → -rgc
 //   - inside deadband:         hold (the climb counter resets — climbing
 //                              requires SUSTAINED cold, not borderline cold)
+// After any cap change the controller settles 1 tick (2 for ≥90MHz steps),
+// so the next decision sees the step's thermal effect, not stale heat.
 static void regulateTick() {
     if (!g_ctrl.isActive()) return;
     if (g_ctrl.maxClock <= 0) return;   // clock control unavailable
@@ -699,35 +716,56 @@ static void regulateTick() {
         return;
     }
 
-    double eff    = g_ctrl.effective();
-    double target = static_cast<double>(g_ctrl.targetTemp);
-    int    cur    = g_ctrl.latest();
-
-    // Emergency dive.
-    if (cur >= target + 6) {
-        int newCap = (g_ctrl.capMhz > 0 ? g_ctrl.capMhz : g_ctrl.maxClock) - CLOCK_EMERGENCY_STEP;
-        newCap = std::max(CLOCK_MIN, newCap);
-        if (g_ctrl.capMhz <= 0 || newCap < g_ctrl.capMhz) g_ctrl.setCap(newCap);
-        return;
+    // Cliff detection: if a climb step made the temperature JUMP, we crossed
+    // a V/F voltage step — learn the pre-climb cap and never climb past it.
+    if (g_ctrl.climbFromCap > 0) {
+        int rise = g_ctrl.latest() - g_ctrl.climbFromTemp;
+        if (rise >= CLIFF_RISE_C) {
+            g_ctrl.cliffMhz = g_ctrl.climbFromCap;
+            log("cliff: %d→%dMHz raised temp %d→%d°C — parking at %dMHz",
+                g_ctrl.climbFromCap, g_ctrl.capMhz, g_ctrl.climbFromTemp,
+                g_ctrl.latest(), g_ctrl.cliffMhz);
+            g_ctrl.climbFromCap = 0;
+            g_ctrl.climbChecks  = 0;
+            if (g_ctrl.capMhz > g_ctrl.cliffMhz)
+                g_ctrl.setCap(g_ctrl.cliffMhz);   // we know it's poison — leave NOW
+        } else if (++g_ctrl.climbChecks >= 2) {
+            g_ctrl.climbFromCap = 0;   // no cliff — the workload just drifted
+            g_ctrl.climbChecks  = 0;
+        }
     }
 
-    // Too hot: steady dive, every tick.
-    if (eff > target + DEADBAND_C) {
+    double eff    = g_ctrl.effective();
+    double target = static_cast<double>(g_ctrl.targetTemp);
+    double err    = eff - target;          // + = too hot
+
+    // Too hot: proportional dive, every settle window.
+    if (err > DEADBAND_C) {
         g_ctrl.coolTicks = 0;
+        g_ctrl.climbFromCap = 0;   // managing heat — pending cliff check moot
+        int step = std::clamp(static_cast<int>(err * CLOCK_KP), CLOCK_STEP_MIN, CLOCK_STEP_MAX);
         int base = (g_ctrl.capMhz > 0) ? g_ctrl.capMhz : g_ctrl.maxClock;
-        int step = (g_ctrl.capMhz > 0) ? CLOCK_STEP_DOWN : CLOCK_STEP_DOWN_FIRST;
         int newCap = std::max(CLOCK_MIN, base - step);
         if (g_ctrl.capMhz <= 0 || newCap < g_ctrl.capMhz) g_ctrl.setCap(newCap);
         return;
     }
 
-    // Too cool: reluctant climb after sustained cool.
-    if (eff < target - DEADBAND_C) {
+    // Too cool: reluctant climb after sustained cool, also proportional.
+    if (err < -DEADBAND_C) {
         if (++g_ctrl.coolTicks < CLOCK_COOL_TICKS) return;
         g_ctrl.coolTicks = 0;
         if (g_ctrl.capMhz <= 0) return;   // nothing to restore
-        int newCap = g_ctrl.capMhz + CLOCK_STEP_UP;
-        g_ctrl.setCap(newCap >= g_ctrl.maxClock ? 0 : newCap);
+        int step = std::clamp(static_cast<int>(-err * CLOCK_KP_UP), CLOCK_STEP_MIN, CLOCK_STEP_UP_MAX);
+        int newCap = g_ctrl.capMhz + step;
+        if (g_ctrl.cliffMhz > 0 && newCap > g_ctrl.cliffMhz) {
+            if (g_ctrl.capMhz >= g_ctrl.cliffMhz) return;   // parked at the cliff
+            newCap = g_ctrl.cliffMhz;                        // approach, don't cross
+        }
+        if (newCap >= g_ctrl.maxClock) { g_ctrl.setCap(0); return; }
+        g_ctrl.climbFromCap  = g_ctrl.capMhz;   // arm cliff detection
+        g_ctrl.climbFromTemp = g_ctrl.latest();
+        g_ctrl.climbChecks   = 0;
+        g_ctrl.setCap(newCap);
         return;
     }
 
