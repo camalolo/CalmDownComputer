@@ -83,8 +83,9 @@ Control flow: `wWinMain` → hidden tool window + tray → `SetTimer` 10s →
 `requestTrayRefresh` → `regulateTick()`. The worker loop (~1/s): `queryTemp`
 → apply pending cap (`-lgc`/`-rgc`) → `cpuTick()` (CPU governor) → publish
 temp → tray refresh. While the CPU governor is engaged, the tray blink
-alternates cached GPU/CPU icons once per `TRAY_BLINK_MS` (10s) — one
-Shell_NotifyIcon per phase, no per-blink rendering.
+alternates GPU temp ↔ CPU state icons on fixed wall-clock phases
+(`TRAY_BLINK_MS` 10s), posting only on phase changes — a state change shows
+its colour immediately. CPU phases paint the frozen CPU load %.
 UI→worker commands: `enqueueCap()`; worker→UI results: `capDone`
 (-1 restored, >0 applied MHz, <0 failed). `capMhz` in the Controller is
 updated only from confirmed results.
@@ -194,5 +195,9 @@ Key plumbing:
 - `nvidia-smi` must be on PATH; missing GPU reads are non-fatal (temp −1 →
   grey `--` icon, regulation pauses). If `clocks.max.sm` is unavailable,
   clock control is disabled entirely (the app has no other lever).
+- **No ACPI thermal zones on this board** (`MSAcpi_ThermalZoneTemperature`
+  returns an empty list): real CPU temp is unreachable without a kernel
+  driver (Ryzen SMN needs ring0). The CPU blink phases show CPU load % —
+  don't reintroduce WMI temp queries here.
 - Everything interesting is logged to the exe-dir log via `log()`
   (mutex-protected, append per call).

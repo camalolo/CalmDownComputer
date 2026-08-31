@@ -12,9 +12,11 @@ background services — just a single ~240 KB static `.exe` in the tray.
 
 - **Live GPU temperature in the tray icon** — a colour-coded number that shifts
   from green → yellow → orange → red as the GPU heats up. While the CPU
-  governor is engaged, the icon gently blinks between the GPU colour and a
-  CPU state colour: blue = 95% capped (office), purple = 100% boost. The two
-  blink icons are pre-rendered once, so blinking costs no rendering at all.
+  governor is engaged, the icon slowly alternates: **blue** = 95% capped
+  (office), **purple** = 100% boost — each CPU phase carrying the CPU load %.
+  (Real CPU temp needs a kernel driver; consumer boards expose no ACPI sensor
+  to user mode, so load is shown instead.) Icons are pre-rendered and posted
+  only on phase changes — effectively zero cost.
 - **GPU clock regulation** — click the tray to pick a target (Off, 60–90 °C,
   ∞). The app steers the GPU core-clock cap (`nvidia-smi -lgc`) proportionally:
   fast dive when hot, reluctant climb when cool, ±1.5 °C deadband, and it

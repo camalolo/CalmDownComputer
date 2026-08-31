@@ -1051,14 +1051,18 @@ static DWORD WINAPI workerMain(LPVOID) {
     }
 
     // Cached icons for the CPU-state blink: the GPU temp icon (lastIcon)
-    // alternates with a solid CPU-state colour. Blinking therefore costs one
-    // Shell_NotifyIcon per phase and ZERO GDI work per blink — the two state
-    // icons are painted once, lazily.
-    HICON lastIcon    = nullptr;      // current GPU temp icon
-    HICON cpuCool     = nullptr;      // blue   — AC max capped at 95%
-    HICON cpuBoost    = nullptr;      // purple — boost restored (100%)
-    bool  blinkTemp   = false;        // next phase shows the CPU colour…
-    ULONGLONG blinkAnchor = 0;        // …after TRAY_BLINK_MS since the last flip
+    // alternates with a CPU-state icon (blue/purple + frozen load %) on
+    // wall-clock phases. One Shell_NotifyIcon per phase change, repaint only
+    // once per phase — GDI work stays out of the hot loop. (Real CPU temp is
+    // unavailable: this board exposes no ACPI thermal zone, and Ryzen SMN
+    // reads need a kernel driver.)
+    HICON lastIcon         = nullptr;   // current GPU temp icon
+    HICON cpuCool          = nullptr;   // blue   — AC max capped at 95%
+    HICON cpuBoost         = nullptr;   // purple — boost restored (100%)
+    std::string cpuCoolTxt, cpuBoostTxt;    // load % painted into each icon
+    int   lastSeenCpuState = 0;         // to announce state changes instantly
+    ULONGLONG paintPhase   = 0;         // phase the frozen load was taken in
+    int       paintUsage   = -1;
     while (WaitForSingleObject(g_quitEvent, 0) != WAIT_OBJECT_0) {
         int temp = queryTemp();
 
@@ -1098,35 +1102,55 @@ static DWORD WINAPI workerMain(LPVOID) {
             if (tray) wcsncpy_s(tip, g_shared.trayTip, _TRUNCATE);
             LeaveCriticalSection(&g_cs);
         }
-        // Pick the icon to push this iteration: a freshly painted GPU temp
-        // icon wins (and re-anchors the rhythm); otherwise, while the CPU
-        // governor is engaged, flip the blink once per TRAY_BLINK_MS.
+        // Icon policy: while the CPU governor is engaged, alternate GPU temp
+        // colour ↔ CPU state colour on fixed wall-clock phases — independent
+        // of the 10s temp-refresh race. Fresh temp readings are always
+        // cached; they become visible on the next temp phase (the tooltip
+        // carries the live number in the meantime). Post only on change.
         const ULONGLONG nowMs = GetTickCount64();
-        HICON show = nullptr;
+        const int st = g_shared.cpuState;
+        const bool stateChanged = (st != lastSeenCpuState);
+        lastSeenCpuState = st;
         if (tray) {
             HICON h = createTempIcon(temp);
             if (h) {
                 if (lastIcon) DestroyIcon(lastIcon);
-                lastIcon = h;
-                show = h;
-                blinkAnchor = nowMs;
+                lastIcon = h;                 // shown on the next temp phase
             }
             EnterCriticalSection(&g_cs); g_shared.trayDirty = false; LeaveCriticalSection(&g_cs);
         }
-        if (!show && g_shared.cpuMode == CPU_MODE_AUTO &&
-            (g_shared.cpuState == CPU_CAP_PCT || g_shared.cpuState == 100) &&
-            nowMs - blinkAnchor >= TRAY_BLINK_MS) {
-            if (!cpuCool)  cpuCool  = createStatusIcon(RGB(25, 100, 230), "");
-            if (!cpuBoost) cpuBoost = createStatusIcon(RGB(150, 60, 210), "");
-            HICON cpuIcon = (g_shared.cpuState == CPU_CAP_PCT) ? cpuCool : cpuBoost;
-            if (blinkTemp)     show = lastIcon;   // GPU temp colour phase
-            else if (cpuIcon)  show = cpuIcon;    // CPU state colour phase
-            blinkTemp = !blinkTemp;
-            blinkAnchor = nowMs;
+        HICON want = lastIcon;
+        if (g_shared.cpuMode == CPU_MODE_AUTO &&
+            (st == CPU_CAP_PCT || st == 100)) {
+            // A state change always shows its colour immediately.
+            const bool cpuPhase = stateChanged || ((nowMs / TRAY_BLINK_MS) & 1);
+            if (cpuPhase) {
+                // Freeze the load at phase entry: one repaint per phase, not
+                // one per worker iteration.
+                const ULONGLONG phase = nowMs / TRAY_BLINK_MS;
+                if (stateChanged || phase != paintPhase) {
+                    paintPhase = phase;
+                    paintUsage = g_shared.cpuUsage;
+                }
+                HICON*       slot    = (st == CPU_CAP_PCT) ? &cpuCool   : &cpuBoost;
+                std::string* slotTxt = (st == CPU_CAP_PCT) ? &cpuCoolTxt : &cpuBoostTxt;
+                const COLORREF col    = (st == CPU_CAP_PCT) ? RGB(25, 100, 230)
+                                                            : RGB(150, 60, 210);
+                const std::string wantTxt = tempText(paintUsage);
+                if (!*slot || *slotTxt != wantTxt) {
+                    HICON nh = createStatusIcon(col, wantTxt);
+                    if (nh) {
+                        if (*slot) DestroyIcon(*slot);
+                        *slot = nh;
+                        *slotTxt = wantTxt;
+                    }
+                }
+                want = *slot;
+            }
         }
-        if (show) {
+        if (want && want != g_nid.hIcon) {
             if (tip[0]) wcsncpy_s(g_nid.szTip, tip, _TRUNCATE);
-            g_nid.hIcon = show;
+            g_nid.hIcon = want;
             Shell_NotifyIconW(NIM_MODIFY, &g_nid);
         }
         Sleep(200);   // light pacing; the queries above take ~0.5-1s themselves
