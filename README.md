@@ -1,61 +1,66 @@
-# 🌡️ CalmDownGPU
+# 🌡️ CalmDownComputer
 
-A tiny Windows system-tray app that keeps your NVIDIA GPU temperature in check
-by capping its core clocks. No bloated overlays, no background services — just
-a single ~240 KB static `.exe` that sits in your tray and does one job well.
+A tiny Windows system-tray app that keeps your machine cool. It regulates the
+NVIDIA GPU by capping core clocks, and tames the CPU by switching Ryzen's
+Core Performance Boost off when the machine is idle. No bloated overlays, no
+background services — just a single ~240 KB static `.exe` in the tray.
 
-![temperature targets](https://img.shields.io/badge/temp%20targets-60%E2%80%9390%E2%84%83%20%E2%88%9E-blue)
 ![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 ## What it does
 
-- **Live temperature in the tray icon** — a colour-coded number that shifts from
-  green → yellow → orange → red as your GPU heats up. No clicking needed.
-- **Click to set a target** — pick from presets (Off, 60–90 °C in 5° steps, or ∞ for
-  full clocks). The app remembers your choice across restarts.
-- **Clock-only control** — regulates by locking GPU core clocks with
-  `nvidia-smi -lgc`, on 10-second ticks:
-  - **Fast dive** when hot: −30 MHz per tick (first response −150 MHz)
-  - **Emergency dive** when ≥6 °C over target: −150 MHz per tick
-  - **Reluctant climb** when cool: +15 MHz per minute, only after 60 s of
-    sustained below-target temperature
-  - **Settle window**: 20 s of hold after each change, so every decision uses
-    post-effect temperatures, not stale heat
-  - **Deadband** of ±1.5 °C — once stable, nothing moves
-- Power limit is never touched: it is read once at startup and restored on exit.
+- **Live GPU temperature in the tray icon** — a colour-coded number that shifts
+  from green → yellow → orange → red as the GPU heats up. While the CPU
+  governor is engaged, the icon gently blinks between the GPU colour and a
+  CPU state colour: blue = 95% capped (office), purple = 100% boost. The two
+  blink icons are pre-rendered once, so blinking costs no rendering at all.
+- **GPU clock regulation** — click the tray to pick a target (Off, 60–90 °C,
+  ∞). The app steers the GPU core-clock cap (`nvidia-smi -lgc`) proportionally:
+  fast dive when hot, reluctant climb when cool, ±1.5 °C deadband, and it
+  learns the card's voltage cliff (the clock above which temperature explodes)
+  and parks just below it.
+- **CPU boost governor** — Ryzen chips (e.g. 5600X) disable Core Performance
+  Boost whenever the Windows AC "Maximum processor state" is below 100%:
+  the CPU pins at 3.7 GHz base instead of boosting to 4.65 GHz, which is worth
+  ~10–15 °C under office loads. The governor:
+  - detects games by the **foreground process** (≥25% of one core sustained —
+    office apps rarely exceed 10%) plus total load ≥25% as a secondary signal
+  - caps the AC max processor state at **95%** after ~45 s of quiet
+  - restores **100%** after only ~10 s of sustained heavy load — games get
+    their boost back within seconds of launching, office stays cool
+  - hysteresis on both level and time, so it never flaps
+  - verify every write by reading the value back from `powercfg`
+  - DC (battery) is never touched; a manual 95% you set yourself is left
+    alone unless the governor applied one
+- Power limits are never regulated: read once at startup, restored on exit.
 
-## Why clocks, not power?
+## Why these levers?
 
-The card enforces its power limit *through* its clock/voltage curve anyway —
-and on some driver versions the power-limit domain misreports: ranges read
-N/A under load, and the `power.limit` readback ignores applied limits.
-Clock caps apply instantly, can be verified, and keep working all the way
-down to a few hundred MHz — there is no "100 W floor" to get stuck at.
+- **GPU: clocks, not power.** The card enforces its power limit *through* its
+  clock/voltage curve anyway — and on some driver versions the power-limit
+  domain misreports (N/A ranges, readback ignoring applied limits). Clock caps
+  apply instantly, can be verified, and keep working down to a few hundred MHz.
+- **CPU: processor state, not PBO.** The 95% trick is the one lever that's
+  settable and revertible from user space without a BIOS visit — and the
+  temperature win under light load is large because boost voltage disappears.
 
 ## How it works
 
 ```
-nvidia-smi --query-gpu=temperature.gpu   →  read current temp
-nvidia-smi -lgc 210,<cap>                →  cap core clocks
+nvidia-smi --query-gpu=temperature.gpu   →  read GPU temp
+nvidia-smi -lgc 210,<cap>                →  cap GPU core clocks
 nvidia-smi -rgc                          →  restore default clocks
+
+GetSystemTimes()                          →  total CPU load (1 s samples)
+powercfg /setacvalueindex … PROCTHROTTLEMAX 95
+powercfg /setactive SCHEME_CURRENT        →  CPU boost cap on/off
+powercfg /query … PROCTHROTTLEMAX         →  verify the write
 ```
 
-The regulation loop runs every 10 seconds:
-
-1. Read the GPU temperature into a 60-second rolling window (recent samples
-   weigh more).
-2. Over target? Dive: −30 MHz (first engagement −150 MHz); ≥6 °C over →
-   emergency −150 MHz per tick.
-3. After any change, hold for 20 s — clock caps act in milliseconds but the
-   heat takes ~20 s to show, so acting sooner only reacts to stale data.
-4. Under target for 60 s straight? Climb +15 MHz. Back at the ceiling? Unlock
-   clocks (`-rgc`).
-
-The result: a fast, calm descent to your target and a reluctant climb back —
-it finds the clock that holds your temperature and quietly stays there.
-
-All `nvidia-smi` calls and tray painting run on a worker thread, so a hung
+GPU regulation runs on 10-second ticks (weighted average, proportional steps,
+settle windows). The CPU governor samples once a second on the worker thread.
+All external commands and tray painting run on a worker thread, so a hung
 driver call can never freeze the app (a 15-second watchdog kills stalled
 subprocesses).
 
@@ -68,7 +73,7 @@ subprocesses).
 
 ## Download
 
-Grab the latest `CalmDownGPU.exe` from the
+Grab the latest `CalmDownComputer.exe` from the
 [Releases](../../releases) page. No installation — just run it.
 
 ## Building
@@ -78,26 +83,30 @@ cmake -B build -S . -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
 ```
 
-The executable will be at `build/bin/Release/CalmDownGPU.exe`.
+The executable will be at `build/bin/Release/CalmDownComputer.exe`.
 
 Requires C++17, CMake 3.20+, and MSVC (or MinGW-w64; untested). Builds with a
 statically linked CRT by default — no redistributable needed.
 
 ## Logging
 
-The app writes a log **next to the executable** (`CalmDownGPU.log`) with
-timestamps for every temperature reading, clock change, and settle event.
-Useful for tuning or debugging.
+The app writes a log **next to the executable** (`CalmDownComputer.log`) with
+timestamps for every temperature reading, clock change, CPU boost transition,
+and settle event. Useful for tuning or debugging.
 
 ## Notes
 
 - Targets GPU index 0. Edit the `-i 0` arguments in `main.cpp` for a
   different GPU.
-- A clock cap only limits the *maximum* boost — at idle the GPU runs cool and
-  the app keeps its hands off. Regulation matters under load.
-- On startup the app resets any leftover clock locks (including manual ones),
-  so it always starts from a known state.
+- CPU governor thresholds are `#define`s at the top of `main.cpp`
+  (`CPU_CAP_PCT`, `CPU_USAGE_ON_PCT`, `CPU_USAGE_OFF_PCT`, `CPU_ON_MS`,
+  `CPU_OFF_MS`).
+- On startup the app resets any leftover GPU clock locks and removes the
+  legacy `CalmDownGPU` logon task (pre-rename installations).
+- Settings persist in `HKCU\Software\CalmDownComputer` (the old
+  `CalmDownGPU` key is migrated automatically).
 - Single instance only — a mutex prevents multiple copies from running.
+- Exit restores everything: GPU clocks, power limit, and the CPU boost cap.
 
 ## License
 

@@ -1,5 +1,9 @@
-// CalmDownGPU - Windows tray app that regulates GPU temperature by clock capping.
-// Uses nvidia-smi to query temperature and lock core clocks (-lgc).
+// CalmDownComputer - Windows tray app that keeps the whole machine cool.
+// GPU: regulates temperature by clock capping (nvidia-smi -lgc).
+// CPU: caps the AC "Maximum processor state" at 95% while idle — on Ryzen,
+//      anything below 100% disables Core Performance Boost (5600X: pinned at
+//      3.7GHz base instead of 4.65GHz boost, much cooler under office load) —
+//      and restores 100% as soon as a sustained load (a game) shows up.
 // Build: see CMakeLists.txt
 //
 // Key design decisions:
@@ -18,6 +22,10 @@
 //   • Below target: climb 15–30MHz after ~40s of sustained cool
 //   • 10–20s settle window after each change (decisions use post-effect temps)
 //   The power limit is left alone (read once at startup, restored on exit).
+// - CPU governor: sensing is GetSystemTimes + GetProcessTimes of the
+//   foreground process (cheap syscalls); powercfg runs on the worker thread
+//   like every other external command, and every write is verified by
+//   reading the index back.
 
 #ifndef UNICODE
 #define UNICODE
@@ -41,6 +49,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <cstdarg>
 #include <mutex>
@@ -78,13 +87,13 @@ static void logOpen() {
     std::wstring dirW(modW);
     auto slash = dirW.find_last_of(L"\\/");
     if (slash != std::wstring::npos) dirW.erase(slash + 1);
-    dirW += L"CalmDownGPU.log";
+    dirW += L"CalmDownComputer.log";
     WideCharToMultiByte(CP_UTF8, 0, dirW.c_str(), -1, g_logPath, MAX_PATH, nullptr, nullptr);
 
     FILE* f = nullptr;
     if (fopen_s(&f, g_logPath, "a") != 0 || !f) {
         GetTempPathA(MAX_PATH, g_logPath);
-        strcat_s(g_logPath, "CalmDownGPU.log");
+        strcat_s(g_logPath, "CalmDownComputer.log");
     } else {
         fclose(f);
     }
@@ -94,7 +103,7 @@ static void logOpen() {
         fprintf(f, "\n══════════════════════════════════════════\n");
         fclose(f);
     }
-    log("CalmDownGPU starting → log: %s", g_logPath);
+    log("CalmDownComputer starting → log: %s", g_logPath);
 }
 
 // ───────────────────────── Constants ─────────────────────────
@@ -102,6 +111,7 @@ static void logOpen() {
 #define WM_TRAYICON     (WM_USER + 1)
 #define ID_TIMER         1
 #define TIMER_MS         10000       // 10 seconds
+#define TRAY_BLINK_MS    10000       // CPU-state blink phase (~1 flip per 10s)
 #define HISTORY_LEN      6           // rolling window: 6 × 10s = 60s
 #define DEADBAND_C       1.5         // ±1.5°C: don't adjust within this band
 
@@ -121,6 +131,26 @@ static void logOpen() {
 #define CLOCK_MIN        300    // never cap below this (usability floor)
 #define CLOCK_LOW        210    // low end of the -lgc range (idle clock, MHz)
 
+// CPU boost governor. On Ryzen, AC "Maximum processor state" < 100% disables
+// Core Performance Boost: the CPU sits at base clock — much cooler under
+// office loads, but games lose the boost. So: cap while quiet, lift the cap
+// when real work shows up. Two signals, with asymmetric roles:
+//   • foreground process time (GetProcessTimes) — a game pins ≥25% of one
+//     core; office apps rarely sustain >10%. Drives BOTH directions: heavy
+//     foreground boosts, quiet foreground re-caps.
+//   • total load (GetSystemTimes) — BUSY-side only: catches background
+//     compiles and alt-tabbed games. Too noisy (13-25% ambient on a desktop)
+//     to gate the cap, so it never vetoes one.
+// Blip tolerance: streak timers only cancel each other when one ACTUALLY
+// fires (boost after 10s sustained busy, cap after 45s sustained quiet) —
+// single noisy samples never reset the 45s wait.
+#define CPU_CAP_PCT       95    // AC max processor state while capped
+#define CPU_USAGE_ON_PCT  25    // total CPU load above this counts as busy
+#define FG_ON_PCT         25    // foreground proc above this % of one core = busy
+#define FG_OFF_PCT        10    // foreground proc below this % of one core = quiet
+#define CPU_ON_MS         10000 // busy must persist this long before boost
+#define CPU_OFF_MS        45000 // quiet must persist this long before the cap
+
 #define IDI_APP          100
 
 // Menu command IDs
@@ -134,9 +164,14 @@ enum : UINT {
     IDM_T85     = 2006,
     IDM_T90     = 2007,
     IDM_INF     = 2008,   // ∞ — max power
-    IDM_STARTUP = 2500,   // Start at logon toggle
-    IDM_EXIT    = 3000,
+    IDM_STARTUP   = 2500,   // Start at logon toggle
+    IDM_CPU_AUTO  = 2510,   // CPU governor: auto (cap when idle)
+    IDM_CPU_OFF   = 2511,   // CPU governor: off (never touch it)
+    IDM_EXIT      = 3000,
 };
+
+// CPU governor modes (persisted as HKCU…\CpuAuto = 1/0)
+enum : int { CPU_MODE_AUTO = 1, CPU_MODE_OFF = 2 };
 
 // Forward declarations (defined with the worker bridge below).
 static void enqueueCap(int capMhz);          // -1 = restore default clocks
@@ -311,7 +346,27 @@ static bool resetClocks() {
 
 // ───────────────────────── Dynamic tray icon ─────────────────────────
 
-static HICON createTempIcon(int temp) {
+// Tray icon background by GPU temperature severity.
+static COLORREF tempColor(int temp) {
+    if (temp < 0)   return RGB(70, 70, 70);     // grey — error
+    if (temp < 60)  return RGB(30, 140, 70);    // green
+    if (temp < 70)  return RGB(80, 170, 50);    // light-green
+    if (temp < 75)  return RGB(180, 170, 30);   // yellow
+    if (temp < 80)  return RGB(210, 130, 30);   // orange
+    if (temp < 85)  return RGB(210, 80, 30);    // dark-orange
+    return RGB(200, 40, 40);                    // red
+}
+
+static std::string tempText(int temp) {
+    if (temp < 0)   return "--";
+    if (temp > 99)  return "99";
+    return std::to_string(temp);
+}
+
+// Draw a tray icon: solid background + centred text (omitted when empty).
+// All the GDI work happens here — callers that flash the icon must CACHE the
+// result and alternate handles, never re-run this per blink.
+static HICON createStatusIcon(COLORREF bg, const std::string& text) {
     const int sz = GetSystemMetrics(SM_CXSMICON);  // 16 at 100% DPI
     if (sz <= 0) return nullptr;
 
@@ -331,16 +386,6 @@ static HICON createTempIcon(int temp) {
     HBITMAP hBmp = CreateDIBSection(hScreen, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
     HBITMAP hOld = (HBITMAP)SelectObject(hdcMem, hBmp);
 
-    // Background colour by temperature severity.
-    COLORREF bg;
-    if (temp < 0)        bg = RGB(70, 70, 70);     // grey — error
-    else if (temp < 60)  bg = RGB(30, 140, 70);    // green
-    else if (temp < 70)  bg = RGB(80, 170, 50);    // light-green
-    else if (temp < 75)  bg = RGB(180, 170, 30);   // yellow
-    else if (temp < 80)  bg = RGB(210, 130, 30);   // orange
-    else if (temp < 85)  bg = RGB(210, 80, 30);    // dark-orange
-    else                 bg = RGB(200, 40, 40);    // red
-
     // Fill background (rounded rect).
     HBRUSH hBrush = CreateSolidBrush(bg);
     RECT rc{ 0, 0, sz, sz };
@@ -355,29 +400,26 @@ static HICON createTempIcon(int temp) {
     SelectObject(hdcMem, hOldPen);
     DeleteObject(hPen);
 
-    // Temperature text.
-    std::string text;
-    if (temp < 0)        text = "--";
-    else if (temp > 99)  text = "99";
-    else                 text = std::to_string(temp);
+    // Optional centred text (CPU-state icons are plain colour blocks).
+    if (!text.empty()) {
+        SetBkMode(hdcMem, TRANSPARENT);
+        SetTextColor(hdcMem, RGB(255, 255, 255));
 
-    SetBkMode(hdcMem, TRANSPARENT);
-    SetTextColor(hdcMem, RGB(255, 255, 255));
+        int fontH = sz * 10 / 16;  // proportional to icon size
+        if (fontH < 8) fontH = 8;
 
-    int fontH = sz * 10 / 16;  // proportional to icon size
-    if (fontH < 8) fontH = 8;
+        HFONT hFont = CreateFontA(
+            fontH, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            NONANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+            "Tahoma");
+        HFONT hOldFont = (HFONT)SelectObject(hdcMem, hFont);
 
-    HFONT hFont = CreateFontA(
-        fontH, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        NONANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-        "Tahoma");
-    HFONT hOldFont = (HFONT)SelectObject(hdcMem, hFont);
+        DrawTextA(hdcMem, text.c_str(), -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-    DrawTextA(hdcMem, text.c_str(), -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-    SelectObject(hdcMem, hOldFont);
-    DeleteObject(hFont);
+        SelectObject(hdcMem, hOldFont);
+        DeleteObject(hFont);
+    }
 
     // Fix alpha channel — GDI leaves it at 0; set to 255 for opaque pixels.
     DWORD* px = static_cast<DWORD*>(bits);
@@ -416,11 +458,15 @@ static HICON createTempIcon(int temp) {
     return hIcon;
 }
 
+static HICON createTempIcon(int temp) {
+    return createStatusIcon(tempColor(temp), tempText(temp));
+}
+
 // ───────────────────────── Scheduled task helpers ─────────────────────────
 
-static const char* TASK_NAME = "CalmDownGPU";
+static const char* TASK_NAME = "CalmDownComputer";
 
-// Returns true if the "CalmDownGPU" scheduled task exists.
+// Returns true if the autostart task exists.
 static bool isStartupTaskEnabled() {
     std::string cmd = std::string("schtasks /query /tn ") + TASK_NAME + " /fo csv /nh";
     auto r = runHidden(cmd.c_str());
@@ -451,30 +497,53 @@ static bool deleteStartupTask() {
 
 // ───────────────────────── Registry persistence ─────────────────────────
 
-static const wchar_t* REG_KEY = L"Software\\CalmDownGPU";
+static const wchar_t* REG_KEY = L"Software\\CalmDownComputer";
 
-static void saveTargetTemp(int temp) {
+static void saveDword(const wchar_t* name, int val) {
     HKEY hKey;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_KEY, 0, nullptr, 0,
                         KEY_WRITE, nullptr, &hKey, nullptr) == ERROR_SUCCESS) {
-        RegSetValueExW(hKey, L"TargetTemp", 0, REG_DWORD,
-                       reinterpret_cast<const BYTE*>(&temp), sizeof(temp));
+        DWORD v = static_cast<DWORD>(val);
+        RegSetValueExW(hKey, name, 0, REG_DWORD,
+                       reinterpret_cast<const BYTE*>(&v), sizeof(v));
         RegCloseKey(hKey);
     }
 }
 
-static int loadTargetTemp() {
+static int regReadDword(const wchar_t* subkey, const wchar_t* name, int def) {
     HKEY hKey;
-    int temp = 0;  // default: Off
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_KEY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        DWORD val = 0, size = sizeof(val);
-        if (RegQueryValueExW(hKey, L"TargetTemp", nullptr, nullptr,
-                             reinterpret_cast<BYTE*>(&val), &size) == ERROR_SUCCESS)
-            temp = static_cast<int>(val);
+    int val = def;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, subkey, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        DWORD v = 0, size = sizeof(v);
+        if (RegQueryValueExW(hKey, name, nullptr, nullptr,
+                             reinterpret_cast<BYTE*>(&v), &size) == ERROR_SUCCESS)
+            val = static_cast<int>(v);
         RegCloseKey(hKey);
+    }
+    return val;
+}
+
+static void saveTargetTemp(int temp) { saveDword(L"TargetTemp", temp); }
+
+static int loadTargetTemp() {
+    int temp = regReadDword(REG_KEY, L"TargetTemp", -1);
+    if (temp < 0) {
+        // First run after the CalmDownGPU → CalmDownComputer rename: carry
+        // the old setting over. (0 = Off is the default; nothing to carry.)
+        temp = regReadDword(L"Software\\CalmDownGPU", L"TargetTemp", 0);
+        if (temp != 0) saveTargetTemp(temp);
     }
     return temp;
 }
+
+// CPU governor preference; default ON — office-cool is the point of the app.
+static bool loadCpuAuto() {
+    int v = regReadDword(REG_KEY, L"CpuAuto", -1);
+    if (v < 0) v = regReadDword(L"Software\\CalmDownGPU", L"CpuAuto", 1);
+    return v != 0;
+}
+
+static void saveCpuAuto(bool on) { saveDword(L"CpuAuto", on ? 1 : 0); }
 
 // ───────────────────────── Controller ─────────────────────────
 //
@@ -573,6 +642,9 @@ struct SharedState {
     volatile int  pendingCap   = 0;     // UI → worker: -1 reset, >0 cap, 0 none
     volatile int  capDone      = 0;     // worker → UI: -1 restored, >0 applied, <0 failed
     volatile int  maxClock     = 0;
+    volatile int  cpuMode      = CPU_MODE_AUTO;  // UI → worker: governor mode
+    volatile int  cpuUsage     = -1;             // worker → UI: total CPU load %
+    volatile int  cpuState     = 0;              // worker → UI: applied AC max
     volatile bool initDone     = false;
     volatile bool trayDirty    = false;
     wchar_t       trayTip[128]{};
@@ -593,6 +665,162 @@ static void requestTrayRefresh(const std::wstring& tip) {
     EnterCriticalSection(&g_cs);
     wcsncpy_s(g_shared.trayTip, tip.c_str(), _TRUNCATE);
     g_shared.trayDirty = true;
+    LeaveCriticalSection(&g_cs);
+}
+
+// ───────────────────── CPU boost governor ─────────────────────
+// Office-cool by default: cap the AC max processor state at 95% (Ryzen:
+// Core Performance Boost off → base clock → cool), lift the cap when the
+// machine does sustained work. powercfg is a two-step write (setacvalueindex
+// alone never takes effect) and runHidden cannot run "&&", so both steps run
+// as separate children — then the index is read back to verify.
+
+static int queryCpuUsagePct() {
+    static ULONGLONG pIdle = 0, pTotal = 0;   // worker thread only
+    FILETIME fi, fk, fu;
+    if (!GetSystemTimes(&fi, &fk, &fu)) return -1;
+    ULONGLONG idle  = (ULONGLONG(fi.dwHighDateTime) << 32) | fi.dwLowDateTime;
+    ULONGLONG total = ((ULONGLONG(fk.dwHighDateTime) << 32) | fk.dwLowDateTime)
+                    + ((ULONGLONG(fu.dwHighDateTime) << 32) | fu.dwLowDateTime);
+    if (!pTotal) { pIdle = idle; pTotal = total; return -1; }   // need a delta
+    ULONGLONG dI = idle - pIdle, dT = total - pTotal;
+    pIdle = idle; pTotal = total;
+    return dT ? (int)((100 * (dT - dI)) / dT) : -1;
+}
+
+// CPU time of the FOREGROUND process, as % of one core (can exceed 100 for
+// multi-thread saturation — clamped). -1 when unknown. This is the game
+// detector: office apps barely register here, games pin a core.
+static int queryForegroundPct() {
+    static ULONGLONG pProc = 0, pWallMs = 0;
+    static DWORD     pPid  = 0;                // worker thread only
+    ULONGLONG wallMs = GetTickCount64();
+    DWORD pid = 0;
+    if (HWND hwnd = GetForegroundWindow())
+        GetWindowThreadProcessId(hwnd, &pid);
+    ULONGLONG proc = 0;
+    if (pid) {
+        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (h) {
+            FILETIME fc, fe, fk, fu;
+            if (GetProcessTimes(h, &fc, &fe, &fk, &fu))
+                proc = ((ULONGLONG(fk.dwHighDateTime) << 32) | fk.dwLowDateTime)
+                     + ((ULONGLONG(fu.dwHighDateTime) << 32) | fu.dwLowDateTime);
+            CloseHandle(h);
+        }
+    }
+    int pct = -1;
+    if (pid && pid == pPid && pProc && pWallMs && wallMs > pWallMs) {
+        ULONGLONG dP = proc - pProc, dMs = wallMs - pWallMs;
+        pct = (int)std::min<ULONGLONG>(100, (100 * dP) / (dMs * 10000));
+    }
+    pProc = proc; pPid = pid; pWallMs = wallMs;
+    return pct;
+}
+
+static bool setAcMaxProcessorState(int pct) {
+    std::string set = "powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR"
+                      " PROCTHROTTLEMAX " + std::to_string(pct);
+    auto a = runHidden(set.c_str());
+    auto b = runHidden("powercfg /setactive SCHEME_CURRENT");
+    return a.exitCode == 0 && b.exitCode == 0;
+}
+
+// Read the AC index back. The output lists "Possible Settings" bounds first
+// (their 0x00000000 would poison a naive "first 0x" parse — seen in the log),
+// so take the LAST two "0x…" tokens: the index lines are always last, AC
+// before DC (DC can be absent on desktops). Locale-independent.
+static int queryAcMaxProcessorState() {
+    auto r = runHidden("powercfg /query SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX");
+    size_t dc = r.output.rfind("0x");
+    if (dc == std::string::npos) return -1;
+    size_t ac = (dc > 0) ? r.output.rfind("0x", dc - 1) : std::string::npos;
+    if (ac == std::string::npos) ac = dc;
+    return (int)strtoul(r.output.c_str() + ac, nullptr, 16);
+}
+
+// Apply the cap (true) or restore full boost (false); verify the readback.
+static bool applyCpuState(bool capped) {
+    const int pct = capped ? CPU_CAP_PCT : 100;
+    bool ok = setAcMaxProcessorState(pct);
+    int got = ok ? queryAcMaxProcessorState() : -1;
+    if (got == pct) log("cpu: AC max processor state %d%% OK (verified)", pct);
+    else            log("cpu: AC max %d%% NOT verified (cmd ok=%d, readback %d%%)",
+                        pct, ok, got);
+    return got == pct;
+}
+
+// Governor state — worker thread only.
+struct CpuGov {
+    int       want     = 0;    // last seen UI mode (0 = none yet)
+    int       applied  = 0;    // last applied AC max: 0 none, 95, 100
+    ULONGLONG hotSince = 0, coldSince = 0;
+};
+static CpuGov g_cpu;
+
+static void cpuTick() {
+    const int usage = queryCpuUsagePct();
+    const int fg    = queryForegroundPct();
+    const int want  = g_shared.cpuMode;
+
+    if (want != g_cpu.want) {
+        g_cpu.want = want;
+        g_cpu.hotSince = 0;
+        // An explicit switch to AUTO applies on the first idle sample —
+        // don't make the user wait out the full idle window.
+        g_cpu.coldSince = (want == CPU_MODE_AUTO) ? GetTickCount() - CPU_OFF_MS : 0;
+        log("cpu: mode → %s", want == CPU_MODE_AUTO ? "auto" : "off");
+    }
+
+    if (want == CPU_MODE_OFF) {
+        // Stand down; only undo a cap we applied ourselves.
+        if (g_cpu.applied == CPU_CAP_PCT && applyCpuState(false))
+            g_cpu.applied = 100;
+    } else if (usage >= 0) {
+        const ULONGLONG now = GetTickCount64();
+        // Busy when a heavy app owns the foreground (game) or the whole CPU
+        // is loaded (compile, alt-tabbed game). Quiet is keyed on the
+        // foreground signal ALONE — total load spikes with desktop background
+        // noise, and one noisy sample must never veto the re-cap.
+        char fgs[8];
+        if (fg >= 0) snprintf(fgs, sizeof(fgs), "%d", fg);
+        else         strcpy_s(fgs, "n/a");
+        const bool busy = (fg >= FG_ON_PCT) || (usage >= CPU_USAGE_ON_PCT);
+        if (busy) {                                // heavy work: head for boost
+            if (!g_cpu.hotSince) g_cpu.hotSince = now;         // streak start
+            if (g_cpu.applied != 100 && now - g_cpu.hotSince >= CPU_ON_MS) {
+                log("cpu: %d%% total / %s%% fg sustained → restoring boost",
+                    usage, fgs);
+                if (applyCpuState(false)) {
+                    g_cpu.applied = 100;
+                    g_cpu.coldSince = 0;    // boost FIRED → drop the pending cap
+                } else {
+                    g_cpu.hotSince = now;   // failed — retry a full window later
+                }
+            }
+        } else {
+            g_cpu.hotSince = 0;                            // busy streak ended
+            if (fg >= 0 && fg <= FG_OFF_PCT) {             // quiet: head for cap
+                if (!g_cpu.coldSince) g_cpu.coldSince = now;   // streak start
+                if (g_cpu.applied != CPU_CAP_PCT && now - g_cpu.coldSince >= CPU_OFF_MS) {
+                    log("cpu: %d%% total / %s%% fg quiet sustained → capping AC max"
+                        " at %d%% (Core Boost off)", usage, fgs, CPU_CAP_PCT);
+                    if (applyCpuState(true)) {
+                        g_cpu.applied = CPU_CAP_PCT;
+                    } else {
+                        g_cpu.coldSince = now;  // failed — retry a full window later
+                    }
+                }
+            }
+            // In between (mid foreground, or unknown): band — hold, and keep
+            // both timers. Blips can't cancel them; only a FIRING transition
+            // does. Sporadic spikes therefore can't veto the cap forever.
+        }
+    }
+
+    EnterCriticalSection(&g_cs);
+    g_shared.cpuUsage = usage;
+    g_shared.cpuState = g_cpu.applied;
     LeaveCriticalSection(&g_cs);
 }
 
@@ -627,7 +855,7 @@ static std::wstring targetLabel() {
 }
 
 static std::wstring buildTipText() {
-    std::wstring s = L"CalmDownGPU";
+    std::wstring s = L"CalmDownComputer";
     if (!g_gpuName.empty()) {
         s += L" - ";
         // Convert GPU name (UTF-8/ANSI) to wide.
@@ -640,13 +868,22 @@ static std::wstring buildTipText() {
     }
     s += L"\nTemp: ";
     s += (g_lastTemp >= 0) ? std::to_wstring(g_lastTemp) + L"\u00B0C" : L"--";
-    s += L"\nClock cap: ";
+    s += L"\nCap: ";
     s += (g_ctrl.capMhz > 0) ? std::to_wstring(g_ctrl.capMhz) + L" MHz" : L"none";
     if (g_ctrl.cliffMhz > 0)
-        s += L"  (cliff " + std::to_wstring(g_ctrl.cliffMhz) + L" MHz)";
+        s += L" (cliff " + std::to_wstring(g_ctrl.cliffMhz) + L" MHz)";
     s += L"\nTarget: " + targetLabel();
-    if (g_ctrl.isActive() && !g_ctrl.history.empty())
-        s += L"  (avg " + std::to_wstring(static_cast<int>(g_ctrl.weightedAvg())) + L"\u00B0C)";
+    // CPU governor — kept compact; the tray tooltip caps at 128 chars.
+    if (g_shared.cpuMode == CPU_MODE_OFF)
+        s += L"\nCPU: off";
+    else if (g_shared.cpuState == CPU_CAP_PCT)
+        s += L"\nCPU: 95% office";
+    else if (g_shared.cpuState == 100)
+        s += L"\nCPU: 100% boost";
+    else
+        s += L"\nCPU: …";
+    if (g_shared.cpuUsage >= 0)
+        s += L" · " + std::to_wstring(g_shared.cpuUsage) + L"% load";
     return s;
 }
 
@@ -665,6 +902,14 @@ static void rebuildMenu() {
             flags |= MF_CHECKED;
         AppendMenuW(g_hMenu, flags, p.cmdId, p.label);
     }
+
+    AppendMenuW(g_hMenu, MF_SEPARATOR, 0, nullptr);
+
+    // CPU boost governor toggle.
+    UINT cpuAutoFlags = MF_STRING | (g_shared.cpuMode == CPU_MODE_AUTO ? MF_CHECKED : 0);
+    UINT cpuOffFlags  = MF_STRING | (g_shared.cpuMode == CPU_MODE_OFF  ? MF_CHECKED : 0);
+    AppendMenuW(g_hMenu, cpuAutoFlags, IDM_CPU_AUTO, L"CPU: auto (cool idle, boost on load)");
+    AppendMenuW(g_hMenu, cpuOffFlags,  IDM_CPU_OFF,  L"CPU: off (leave at 100%)");
 
     AppendMenuW(g_hMenu, MF_SEPARATOR, 0, nullptr);
 
@@ -798,7 +1043,22 @@ static DWORD WINAPI workerMain(LPVOID) {
     // make "cap=none" a lie and the first dive could land above the real cap.
     resetClocks();
 
-    HICON lastIcon = nullptr;
+    // One-time rename migration: delete the pre-rename logon task so it
+    // stops failing at every logon while pointing at the old exe.
+    if (runHidden("schtasks /query /tn CalmDownGPU /fo csv /nh").exitCode == 0) {
+        auto del = runHidden("schtasks /delete /tn CalmDownGPU /f");
+        log("startup: removed legacy CalmDownGPU logon task (exit=%lu)", del.exitCode);
+    }
+
+    // Cached icons for the CPU-state blink: the GPU temp icon (lastIcon)
+    // alternates with a solid CPU-state colour. Blinking therefore costs one
+    // Shell_NotifyIcon per phase and ZERO GDI work per blink — the two state
+    // icons are painted once, lazily.
+    HICON lastIcon    = nullptr;      // current GPU temp icon
+    HICON cpuCool     = nullptr;      // blue   — AC max capped at 95%
+    HICON cpuBoost    = nullptr;      // purple — boost restored (100%)
+    bool  blinkTemp   = false;        // next phase shows the CPU colour…
+    ULONGLONG blinkAnchor = 0;        // …after TRAY_BLINK_MS since the last flip
     while (WaitForSingleObject(g_quitEvent, 0) != WAIT_OBJECT_0) {
         int temp = queryTemp();
 
@@ -819,6 +1079,9 @@ static DWORD WINAPI workerMain(LPVOID) {
                 EnterCriticalSection(&g_cs); g_shared.capDone = -pendC; LeaveCriticalSection(&g_cs);  // negative = failed
             }
         }
+        // CPU boost governor — sensing + powercfg live on this thread.
+        cpuTick();
+
         // Publish readings for the UI tick.
         {
             EnterCriticalSection(&g_cs);
@@ -835,16 +1098,36 @@ static DWORD WINAPI workerMain(LPVOID) {
             if (tray) wcsncpy_s(tip, g_shared.trayTip, _TRUNCATE);
             LeaveCriticalSection(&g_cs);
         }
+        // Pick the icon to push this iteration: a freshly painted GPU temp
+        // icon wins (and re-anchors the rhythm); otherwise, while the CPU
+        // governor is engaged, flip the blink once per TRAY_BLINK_MS.
+        const ULONGLONG nowMs = GetTickCount64();
+        HICON show = nullptr;
         if (tray) {
             HICON h = createTempIcon(temp);
             if (h) {
-                if (tip[0]) wcsncpy_s(g_nid.szTip, tip, _TRUNCATE);
-                g_nid.hIcon = h;
-                Shell_NotifyIconW(NIM_MODIFY, &g_nid);
                 if (lastIcon) DestroyIcon(lastIcon);
                 lastIcon = h;
+                show = h;
+                blinkAnchor = nowMs;
             }
             EnterCriticalSection(&g_cs); g_shared.trayDirty = false; LeaveCriticalSection(&g_cs);
+        }
+        if (!show && g_shared.cpuMode == CPU_MODE_AUTO &&
+            (g_shared.cpuState == CPU_CAP_PCT || g_shared.cpuState == 100) &&
+            nowMs - blinkAnchor >= TRAY_BLINK_MS) {
+            if (!cpuCool)  cpuCool  = createStatusIcon(RGB(25, 100, 230), "");
+            if (!cpuBoost) cpuBoost = createStatusIcon(RGB(150, 60, 210), "");
+            HICON cpuIcon = (g_shared.cpuState == CPU_CAP_PCT) ? cpuCool : cpuBoost;
+            if (blinkTemp)     show = lastIcon;   // GPU temp colour phase
+            else if (cpuIcon)  show = cpuIcon;    // CPU state colour phase
+            blinkTemp = !blinkTemp;
+            blinkAnchor = nowMs;
+        }
+        if (show) {
+            if (tip[0]) wcsncpy_s(g_nid.szTip, tip, _TRUNCATE);
+            g_nid.hIcon = show;
+            Shell_NotifyIconW(NIM_MODIFY, &g_nid);
         }
         Sleep(200);   // light pacing; the queries above take ~0.5-1s themselves
     }
@@ -931,6 +1214,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
         }
+        if (id == IDM_CPU_AUTO || id == IDM_CPU_OFF) {
+            bool on = (id == IDM_CPU_AUTO);
+            g_shared.cpuMode = on ? CPU_MODE_AUTO : CPU_MODE_OFF;
+            saveCpuAuto(on);
+            log("menu: CPU governor %s", on ? "auto" : "off");
+            return 0;
+        }
         if (id == IDM_STARTUP) {
             if (isStartupTaskEnabled())
                 deleteStartupTask();
@@ -942,6 +1232,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // Restore synchronously so it lands even if the worker is gone.
             resetClocks();
             setPowerLimit(g_shared.defaultPower > 0 ? g_shared.defaultPower : 270);
+            if (g_shared.cpuState == CPU_CAP_PCT)
+                applyCpuState(false);   // undo the CPU boost cap
             Shell_NotifyIconW(NIM_DELETE, &g_nid);
             PostQuitMessage(0);
         }
@@ -962,7 +1254,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     // Prevent multiple instances.
-    HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"CalmDownGPU_Mutex");
+    HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"CalmDownComputer_Mutex");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         if (hMutex) CloseHandle(hMutex);
         return 0;
@@ -973,6 +1265,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     // Worker thread owns all nvidia-smi + tray work (see workerMain).
     InitializeCriticalSection(&g_cs);
     g_quitEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);   // manual-reset
+    g_shared.cpuMode = loadCpuAuto() ? CPU_MODE_AUTO : CPU_MODE_OFF;
+    log("CPU governor: %s", g_shared.cpuMode == CPU_MODE_AUTO ? "auto" : "off");
     g_worker = CreateThread(nullptr, 0, workerMain, nullptr, 0, nullptr);
 
     // --- Restore last target ---
@@ -983,13 +1277,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     WNDCLASSW wc{};
     wc.lpfnWndProc   = WndProc;
     wc.hInstance      = hInst;
-    wc.lpszClassName  = L"CalmDownGPU";
+    wc.lpszClassName  = L"CalmDownComputer";
     RegisterClassW(&wc);
 
     // Hidden tool window (not message-only: SetForegroundWindow must work).
     g_hwnd = CreateWindowExW(
         WS_EX_TOOLWINDOW,
-        L"CalmDownGPU", L"CalmDownGPU",
+        L"CalmDownComputer", L"CalmDownComputer",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
         nullptr, nullptr, hInst, nullptr);
@@ -1006,7 +1300,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     // not destroy.
     g_nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP));
     if (!g_nid.hIcon) g_nid.hIcon = createTempIcon(-1);
-    wcscpy_s(g_nid.szTip, L"CalmDownGPU — starting…");
+    wcscpy_s(g_nid.szTip, L"CalmDownComputer — starting…");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
     // --- Timer ---
@@ -1034,6 +1328,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     CloseHandle(g_quitEvent);
     DeleteCriticalSection(&g_cs);
     if (hMutex) CloseHandle(hMutex);
-    log("CalmDownGPU exiting");
+    log("CalmDownComputer exiting");
     return 0;
 }

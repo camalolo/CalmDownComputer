@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate app.ico for CalmDownGPU: blue rounded square + six-armed snowflake.
+"""Generate app.ico for CalmDownComputer: blue rounded square + six-armed snowflake.
 
 Pure stdlib. Sizes 16/24/32/48 as BMP entries, 256 as PNG (zlib).
 Run from the repo root:  python tools/make_icon.py
