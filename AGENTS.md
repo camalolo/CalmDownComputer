@@ -78,6 +78,15 @@ block on a wedged explorer). `runHidden()` is the only subprocess runner —
 `CreateProcess` + `CREATE_NO_WINDOW`, non-blocking pipe drain, 15s watchdog
 that `TerminateProcess`es hung children.
 
+Tray icon lifecycle is self-healing (v1.3.2+): `trayRefresh()` falls back
+from `NIM_MODIFY` to `NIM_ADD`, the worker re-verifies presence every
+`TRAY_ENSURE_MS` (60s), and `WndProc` re-adds on the `TaskbarCreated`
+broadcast (registered in `wWinMain`). Never revert to a single unchecked
+`NIM_ADD` at startup — the autostart task can fire before Explorer's taskbar
+exists, and a lost add meant an invisible-but-running app (v1.3.0 bug).
+Log lines carry `YYYY-MM-DD HH:MM:SS` timestamps (the log spans days; the
+old time-only format made session boundaries ambiguous).
+
 Control flow: `wWinMain` → hidden tool window + tray → `SetTimer` 10s →
 `onTimerTick()` (UI): snapshot `g_shared` → apply confirmed `capDone` →
 `requestTrayRefresh` → `regulateTick()`. The worker loop (~1/s): `queryTemp`

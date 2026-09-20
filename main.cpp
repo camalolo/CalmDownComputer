@@ -68,7 +68,9 @@ static void log(const char* fmt, ...) {
     time_t now = time(nullptr);
     struct tm tmv{};
     localtime_s(&tmv, &now);
-    fprintf(f, "%02d:%02d:%02d ",
+    // Date included: the log accumulates sessions across days.
+    fprintf(f, "%04d-%02d-%02d %02d:%02d:%02d ",
+            tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
             tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
     va_list ap;
     va_start(ap, fmt);
@@ -112,6 +114,7 @@ static void logOpen() {
 #define ID_TIMER         1
 #define TIMER_MS         10000       // 10 seconds
 #define TRAY_BLINK_MS    10000       // CPU-state blink phase (~1 flip per 10s)
+#define TRAY_ENSURE_MS   60000       // periodic tray-icon presence check
 #define HISTORY_LEN      6           // rolling window: 6 × 10s = 60s
 #define DEADBAND_C       1.5         // ±1.5°C: don't adjust within this band
 
@@ -624,6 +627,21 @@ struct Controller {
 // ───────────────────────── Application state ─────────────────────────
 
 static NOTIFYICONDATAW g_nid{};
+
+// NIM_MODIFY the live tray icon; if the icon is not actually in the tray
+// (initial NIM_ADD lost because the taskbar didn't exist yet at logon, or
+// Explorer restarted and the TaskbarCreated broadcast was missed), fall back
+// to NIM_ADD. Keeps the icon self-healing instead of invisible forever.
+static bool trayRefresh() {
+    if (Shell_NotifyIconW(NIM_MODIFY, &g_nid)) return true;
+    return Shell_NotifyIconW(NIM_ADD, &g_nid) != FALSE;
+}
+
+// "TaskbarCreated" broadcast, registered in wWinMain: Explorer sends it to
+// every top-level window when the taskbar is (re)created — all tray icons
+// are then gone and must be re-added.
+static UINT g_msgTaskbarCreated = 0;
+
 static HICON           g_hIcon    = nullptr;
 static HWND            g_hwnd     = nullptr;
 static HMENU           g_hMenu    = nullptr;
@@ -1063,6 +1081,7 @@ static DWORD WINAPI workerMain(LPVOID) {
     int   lastSeenCpuState = 0;         // to announce state changes instantly
     ULONGLONG paintPhase   = 0;         // phase the frozen load was taken in
     int       paintUsage   = -1;
+    ULONGLONG lastTrayEnsure = GetTickCount64();   // periodic tray self-heal
     while (WaitForSingleObject(g_quitEvent, 0) != WAIT_OBJECT_0) {
         int temp = queryTemp();
 
@@ -1151,7 +1170,13 @@ static DWORD WINAPI workerMain(LPVOID) {
         if (want && want != g_nid.hIcon) {
             if (tip[0]) wcsncpy_s(g_nid.szTip, tip, _TRUNCATE);
             g_nid.hIcon = want;
-            Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+            trayRefresh();   // falls back to NIM_ADD when the icon is gone
+        }
+        // Periodic self-heal: even with no icon change pending, make sure the
+        // icon still exists in the tray (covers a missed TaskbarCreated).
+        if (nowMs - lastTrayEnsure >= TRAY_ENSURE_MS) {
+            lastTrayEnsure = nowMs;
+            trayRefresh();
         }
         Sleep(200);   // light pacing; the queries above take ~0.5-1s themselves
     }
@@ -1269,6 +1294,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
 
     default:
+        // Explorer (re)created the taskbar — all tray icons were destroyed;
+        // re-add ours. Plain NIM_ADD is correct here: the tray is fresh, the
+        // icon cannot already exist. (Guard for registration failure.)
+        if (g_msgTaskbarCreated && msg == g_msgTaskbarCreated) {
+            Shell_NotifyIconW(NIM_ADD, &g_nid);
+            return 0;
+        }
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
     return 0;
@@ -1304,6 +1336,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     wc.lpszClassName  = L"CalmDownComputer";
     RegisterClassW(&wc);
 
+    // Registered "TaskbarCreated" message: fires when Explorer's taskbar is
+    // (re)created — at logon this can happen AFTER this app auto-starts.
+    g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+
     // Hidden tool window (not message-only: SetForegroundWindow must work).
     g_hwnd = CreateWindowExW(
         WS_EX_TOOLWINDOW,
@@ -1325,7 +1361,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     g_nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP));
     if (!g_nid.hIcon) g_nid.hIcon = createTempIcon(-1);
     wcscpy_s(g_nid.szTip, L"CalmDownComputer — starting…");
-    Shell_NotifyIconW(NIM_ADD, &g_nid);
+    if (!Shell_NotifyIconW(NIM_ADD, &g_nid))
+        log("tray: initial NIM_ADD failed (taskbar not up yet?) — TaskbarCreated/refresh will re-add");
 
     // --- Timer ---
     SetTimer(g_hwnd, ID_TIMER, TIMER_MS, nullptr);
