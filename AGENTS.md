@@ -10,9 +10,15 @@ is a tiny Windows system-tray app (single static-CRT exe) that keeps the
 machine cool. GPU: regulates NVIDIA temperature by **capping core clocks**
 (`nvidia-smi -lgc`). CPU: caps the AC "Maximum processor state" at 95% when
 idle (disables Ryzen Core Performance Boost) and restores 100% on sustained
-load. The **entire application is `main.cpp`** (~1100 lines) — there is no
-other source. C++17, pure Win32, no third-party dependencies. (main.cpp is
-~1230 lines.)
+load. Display (opt-in, v1.4.0+): this box has VIRTUAL displays (streaming
+driver; the GDI "primary" is one of them), so the governor targets a
+USER-SELECTED display (auto-default: the largest current display). While
+enabled it OWNS that display's resolution from settings: sustained heavy GPU
+load drops it to the game resolution (e.g. 4K → 1440p), sustained quiet
+restores the configured desktop resolution — so the resolution at startup is
+irrelevant. Borderless games render at desktop resolution; a 4K desktop
+drags them to 2160p. The **entire application is `main.cpp`** — there is no other source.
+C++17, pure Win32, no third-party dependencies.
 
 **Why clock-only (v1.2 architecture, user-driven decision):** the card
 enforces its power limit *through* the clock/voltage curve anyway, and the
@@ -89,9 +95,14 @@ old time-only format made session boundaries ambiguous).
 
 Control flow: `wWinMain` → hidden tool window + tray → `SetTimer` 10s →
 `onTimerTick()` (UI): snapshot `g_shared` → apply confirmed `capDone` →
-`requestTrayRefresh` → `regulateTick()`. The worker loop (~1/s): `queryTemp`
-→ apply pending cap (`-lgc`/`-rgc`) → `cpuTick()` (CPU governor) → publish
-temp → tray refresh. While the CPU governor is engaged, the tray blink
+`requestTrayRefresh` → `regulateTick()`. The worker loop (~1/s): `queryTempUtil`
+(temp + utilisation in ONE nvidia-smi call — don't split them back into two
+subprocesses, the churn feeds load sampling) → apply pending cap
+(`-lgc`/`-rgc`) → `cpuTick()` (CPU governor) → `resTick()` (resolution
+governor) → publish temp/util → tray refresh. `queryCpuUsagePct` /
+`queryForegroundPct` are sampled ONCE per iteration in the worker loop and
+passed into `cpuTick`/`resTick` — both keep delta state, a second call per
+iteration would corrupt it. While the CPU governor is engaged, the tray blink
 alternates GPU temp ↔ CPU state icons on fixed wall-clock phases
 (`TRAY_BLINK_MS` 10s), posting only on phase changes — a state change shows
 its colour immediately. CPU phases paint the frozen CPU load %.
@@ -121,6 +132,73 @@ is never touched. Menu: `IDM_CPU_AUTO`/`IDM_CPU_OFF`, persisted as
 `HKCU\Software\CalmDownComputer\CpuAuto`; worker reconciles against
 `g_shared.cpuMode` each tick.
 
+**Resolution governor (`resTick`)**, ~1/s on the worker thread, opt-in
+(default OFF — a sudden display switch is surprising). This box has VIRTUAL
+displays (streaming driver; the GDI "primary" is one), so it targets a
+USER-SELECTED display: `ResDisp` (REG_SZ = GDI device name like
+`\\.\DISPLAY2`, picked from a live `enumDisplays()` menu snapshot;
+empty/absent = auto = largest current display — the real 4K monitor, never
+the virtual ones). OWNERSHIP model — while enabled, BOTH ends come from
+settings, making the startup resolution irrelevant:
+- **Source-gated engage**: `utilization.gpu` ≥`ResOnPct` (menu-configurable
+  "Engage at GPU load" — 25/50/66/75/90%, default 66%, persisted
+  `ResOnPct`) sustained `RES_ON_MS` 10s is only the CANDIDATE condition. The
+  load must then be
+  attributed to an application holding a borderless fullscreen window on
+  the target display (v1.5.0, user-driven):
+  `queryGfxUtilByPid` reads the per-PID graphics utilisation from the
+  PDH "GPU Engine" counters (same data as Task Manager's GPU column;
+  engtype_3D **plus engtype_Graphics_N** — DX12 multi-node titles like RE
+  Engine report Graphics_1 and are invisible to a 3D-only filter, v1.5.2
+  fix; CUDA inference shows under Compute, not graphics), sorts consumers
+  desc and picks the FIRST holding a borderless fullscreen window on the
+  target display — NOT strictly the top consumer (observed live: background
+  chrome 89% out-ranked the fullscreen game 78%; the window decides, not
+  the ranking). Candidacy floor: `min(GFX_SRC_MIN_PCT 15%, onPct/2)` per
+  PID. `pidHasBorderlessFullscreenOn` requires a visible, undecorated (no
+  WS_CAPTION/WS_THICKFRAME, top-level) window covering ≥95% of the target
+  monitor. No graphics consumer (AI inference!) or no such window
+  (background compute/render, windowed tools) → NO drop, logged once per
+  load period (`srcLogged`, top-3 loaded pids included in the refusal
+  line). Engage guard: target already at/below the game
+  res → no-op (`naLogged`) — TRUE-exclusive fullscreen changes the mode
+  itself and lands here, staying self-managed.
+- **Release = source process exit, not quiet** (v1.5.0): at engage a
+  `SYNCHRONIZE` process HANDLE is stored; the ONLY restore trigger is
+  `WaitForSingleObject(handle, 0)` firing (pid-reuse-proof, immune to game
+  pauses / alt-tab / menus / fps dips — that fixed the 2K↔4K flip-flop).
+  Do NOT reintroduce quiet-based restore while dropped.
+- Quiet-normalisation: while NOT dropped, all-quiet sustained `RES_OFF_MS`
+  30s (GPU util ≤`RES_OFF_PCT` 40% AND fg ≤ `FG_OFF_PCT` AND total CPU
+  <`CPU_USAGE_ON_PCT` — the CPU veto prevents flip-flop with an
+  alt-tabbed rendering game) enforces the DESKTOP resolution
+  (`g_defResPresets` → `ResDefaultW/H`, learned on first run from the target
+  display's registry-default mode) — so a manual/startup odd resolution
+  survives at most one quiet window.
+Actuation has THREE tiers in `applyDisplayMode` (v1.6.0): first a **CCD
+source-mode switch** (`ccdSetSourceMode` → `SetDisplayConfig` with
+`Apply|UseSuppliedDisplayConfig|NoOptimization`, retry with
+`+AllowChanges` — the exact technique of Monitor Profile Switcher, whose
+source was studied): changes the desktop (SOURCE) size while leaving the
+panel's TARGET timing untouched → GPU scaling on the native signal →
+**no monitor re-sync, no black flash** (CDS always re-times and blanks
+~2s — measured). Deliberately NO `SDC_SAVE_TO_DATABASE` — stays temporary,
+logoff/reboot reverts. Tier 2: CDS with an exact native mode (see
+findNativeMode); Tier 3: CDS relaxed PELS-only request. The app logs which
+tier fired (`CCD switch … OK` vs `native mode … (CDS fallback)`).
+`restoreToDefault` falls back to the display's registry default (NULL
+devmode revert) when the configured desktop res is unset/rejected.
+DISP_CHANGE_BADMODE marks the offending preset bad until that setting
+changes (`badFallback`/`badDefault`); a PINNED display that vanished pauses
+the governor (logged once, `missingLogged`) — it never silently switches to
+another display. Toggling off / Exit (`restoreResolutionNow`, UI thread) /
+worker back-door shutdown all restore the configured desktop resolution and
+close the source handle (`endSourceTracking`). Menu: `IDM_RES_AUTO` + three
+submenus (game res, desktop res, target display from the live
+`g_menuDisplays` snapshot; `IDM_RES_DISP_BASE`+i dispatch indexes that same
+snapshot). Worker reconciles against `g_shared.resAuto/resTargetW/resTargetH/
+resDefaultW/resDefaultH/resDisp` each tick.
+
 **Regulation (`regulateTick`)**, 10s ticks, history of 6 samples, weighted
 average (newer weighs more), effective = midpoint(avg, latest) when climbing
 else avg, deadband ±1.5°C, steps PROPORTIONAL to the error:
@@ -141,23 +219,30 @@ Key plumbing:
 - `runHidden()` — only way external commands run (`nvidia-smi`, `powercfg`,
   `schtasks`).
 - Target temp persisted in `HKCU\Software\CalmDownComputer\TargetTemp`
-  (REG_DWORD); CPU governor in `...\CpuAuto`. Old `CalmDownGPU` key values
-  are migrated on first run.
+  (REG_DWORD); CPU governor in `...\CpuAuto`; resolution governor in
+  `...\ResAuto` + `...\ResAutoW/H` + `...\ResDefaultW/H` + `...\ResDisp`
+  (REG_SZ). Old `CalmDownGPU` key values are migrated on first run.
 - Logon autostart: scheduled task `CalmDownComputer` created/deleted via
   `schtasks` (`isStartupTaskEnabled`/`createStartupTask`/`deleteStartupTask`).
 - Single instance via named mutex `CalmDownComputer_Mutex`.
 - `IDM_EXIT` synchronously runs `-rgc`, restores the startup power limit,
-  and uncaps the CPU boost if the governor capped it.
+  uncaps the CPU boost if the governor capped it, and restores the dropped
+  desktop resolution.
 
 ## Conventions
 
 - Tuning constants are `#define`s at the top of `main.cpp` (~line 100):
   `HISTORY_LEN`, `DEADBAND_C`, `CLOCK_KP`, `CLOCK_STEP_MIN/MAX`,
   `CLOCK_KP_UP`, `CLOCK_STEP_UP_MAX`, `CLOCK_COOL_TICKS`, `CLOCK_MIN`,
-  `CLOCK_LOW`, and the CPU governor block `CPU_CAP_PCT`,
-  `CPU_USAGE_ON_PCT/OFF_PCT`, `CPU_ON_MS/OFF_MS`.
-- Menu presets are table-driven: `g_presets` + `IDM_*` drive both menu
-  building and `WM_COMMAND` dispatch. Extend the table, not if-branches.
+  `CLOCK_LOW`, the CPU governor block `CPU_CAP_PCT`,
+  `CPU_USAGE_ON_PCT/OFF_PCT`, `CPU_ON_MS/OFF_MS`, and the resolution
+  governor block `RES_ON_PCT/OFF_PCT`, `RES_ON_MS/OFF_MS`.
+- Menu presets are table-driven: `g_presets` (temp targets), `g_resPresets`
+  (game resolutions), `g_defResPresets` (desktop resolutions),
+  `g_pctPresets` (engage thresholds) + `IDM_*` drive both menu building and
+  `WM_COMMAND` dispatch. Extend the table, not if-branches. The
+  target-display submenu is built from the live `enumDisplays()` snapshot
+  (`g_menuDisplays`) instead of a static table.
 - Unicode split: UI is wide (`wWinMain`, `*W` APIs, `std::wstring`);
   `runHidden` is ANSI; convert at the boundary (`buildTipText`).
 - `UNICODE`/`_UNICODE`/`WIN32_LEAN_AND_MEAN`/`NOMINMAX` defined both in

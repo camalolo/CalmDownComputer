@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(CalmDownComputer VERSION 1.3.2 LANGUAGES CXX)
+project(CalmDownComputer VERSION 1.6.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -23,6 +23,7 @@ target_compile_definitions(CalmDownComputer PRIVATE
     _UNICODE
     WIN32_LEAN_AND_MEAN
     NOMINMAX
+    _WIN32_WINNT=0x0A00   # Win10 baseline (pdh.h hides Vista+ APIs otherwise)
 )
 
 target_link_libraries(CalmDownComputer PRIVATE
@@ -30,6 +31,7 @@ target_link_libraries(CalmDownComputer PRIVATE
     shell32    # System tray (Shell_NotifyIcon)
     user32     # Win32 UI / GDI drawing context
     gdi32      # Icon rendering
+    pdh        # Per-process GPU utilisation (GPU Engine counters)
 )
 
 if(MSVC)

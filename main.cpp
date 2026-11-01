@@ -4,6 +4,13 @@
 //      anything below 100% disables Core Performance Boost (5600X: pinned at
 //      3.7GHz base instead of 4.65GHz boost, much cooler under office load) —
 //      and restores 100% as soon as a sustained load (a game) shows up.
+// Display: on sustained heavy GPU load, temporarily drops the SELECTED
+//      display to a game resolution (e.g. 4K → 1440p); on sustained quiet
+//      restores the configured DESKTOP resolution. Borderless games render
+//      at desktop resolution, so a 4K desktop drags every borderless game
+//      to 2160p. Both ends are settings-driven, so the resolution the
+//      machine happens to be in at startup is irrelevant. Virtual displays
+//      (this box has them; the GDI "primary" is one) are never touched.
 // Build: see CMakeLists.txt
 //
 // Key design decisions:
@@ -39,9 +46,18 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00   // Win10 baseline: GPU Engine counters need it
+#endif
 
 #include <windows.h>
 #include <shellapi.h>
+#include <pdh.h>       // per-process GPU utilisation (GPU Engine counters)
+
+// Not declared by every SDK's pdh.h (the documented Win32 value).
+#ifndef PDH_MORE_DATA
+#define PDH_MORE_DATA ((PDH_STATUS)0x800007D2L)
+#endif
 
 #include <string>
 #include <deque>
@@ -154,6 +170,41 @@ static void logOpen() {
 #define CPU_ON_MS         10000 // busy must persist this long before boost
 #define CPU_OFF_MS        45000 // quiet must persist this long before the cap
 
+// Resolution governor. It OWNS the selected display's resolution while
+// enabled: a sustained heavy GPU load that can be SOURCED to an application
+// holding a borderless fullscreen window on that display (a game) → drop to
+// the game (fallback) resolution; the desktop resolution comes back only
+// when that application EXITS. Both ends are settings-driven, so the
+// resolution the machine was in at startup is irrelevant.
+//
+// Why sourcing matters (user-driven decision):
+//   • AI inference saturates the GPU for hours with no game running — heavy
+//     but unsourced (compute engine, no fullscreen window) → never drops.
+//   • Games that auto-pause when they lose the foreground (or just sit in
+//     slow menus) dip their utilisation — if quiet dipped the resolution
+//     back, you'd flip-flop 2K↔4K mid-session. Holding on the process
+//     handle kills that: NOTHING restores until the source process exits.
+//
+// Sensing: total load from nvidia-smi utilisation (piggybacks the ONE
+// per-iteration call), attribution from the GPU Engine performance counters
+// (per-PID engtype_3D — the same data Task Manager shows), window check via
+// EnumWindows (visible, undecorated root window covering ≥95% of the target
+// display). A TRUE-exclusive fullscreen game changes the display mode
+// itself, so the engage guard (current ≤ game res → "nothing to drop")
+// leaves those alone by construction.
+// Quiet-normalisation of the desktop resolution (feature on, nothing
+// dropped, three-signal all-quiet — see RES_OFF_MS below) is unchanged: it
+// makes a manual/startup odd resolution converge to the configured one.
+#define RES_ON_PCT        66    // DEFAULT engage threshold — configurable via
+                                // menu ("Engage at GPU load"), persisted ResOnPct
+#define RES_OFF_PCT       40    // GPU util ≤ this = light load
+#define RES_ON_MS       10000   // heavy load persists this long before the drop
+#define RES_OFF_MS      30000   // all-quiet persists this long before enforcing
+                                // the desktop resolution (NOT used while
+                                // dropped — the source process owns release)
+#define GFX_SRC_MIN_PCT   15    // min per-PID graphics util to source a drop
+                                // (floored at onPct/2 so low thresholds still work)
+
 #define IDI_APP          100
 
 // Menu command IDs
@@ -170,6 +221,19 @@ enum : UINT {
     IDM_STARTUP   = 2500,   // Start at logon toggle
     IDM_CPU_AUTO  = 2510,   // CPU governor: auto (cap when idle)
     IDM_CPU_OFF   = 2511,   // CPU governor: off (never touch it)
+    IDM_RES_AUTO  = 2520,   // resolution governor: drop on heavy GPU load
+    IDM_RES_1440P = 2521,   // game (fallback) resolution 2560x1440
+    IDM_RES_1080P = 2522,   // game (fallback) resolution 1920x1080
+    IDM_RES_DEF_4K   = 2530,   // desktop (rest) resolution 3840x2160
+    IDM_RES_DEF_1440P= 2531,   // desktop (rest) resolution 2560x1440
+    IDM_RES_DEF_1080P= 2532,   // desktop (rest) resolution 1920x1080
+    IDM_RES_DISP_AUTO = 2540,  // target display: auto (largest current)
+    IDM_RES_PCT_25 = 2550,     // engage threshold 25%
+    IDM_RES_PCT_50 = 2551,     // engage threshold 50%
+    IDM_RES_PCT_66 = 2552,     // engage threshold 66% (default)
+    IDM_RES_PCT_75 = 2553,     // engage threshold 75%
+    IDM_RES_PCT_90 = 2554,     // engage threshold 90%
+    IDM_RES_DISP_BASE = 2600,  // + i: live display i from the menu snapshot
     IDM_EXIT      = 3000,
 };
 
@@ -280,13 +344,28 @@ static std::string trim(const std::string& s) {
 
 // ───────────────────────── nvidia-smi wrappers ─────────────────────────
 
-// Returns °C, or -1 on failure.
-static int queryTemp() {
-    auto r = runHidden("nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits -i 0");
+// Returns °C (or -1 on failure) and, via utilOut, GPU utilisation % (-1 when
+// unknown). One subprocess for both readings: extra nvidia-smi invocations
+// would add real CPU load and poison the governor's own load sampling.
+// Utilisation is the heavy-3D detector for the resolution governor — under
+// load, clocks.sm and utilisation both stay honest even with caps applied.
+static int queryTempUtil(int* utilOut) {
+    if (utilOut) *utilOut = -1;
+    auto r = runHidden("nvidia-smi --query-gpu=temperature.gpu,utilization.gpu"
+                       " --format=csv,noheader,nounits -i 0");
     auto s = trim(r.output);
     if (s.empty()) { log("queryTemp: empty response (exit=%lu)", r.exitCode); return -1; }
-    try { int t = std::stoi(s); return t; }
-    catch (...) { log("queryTemp: parse failed: %s", s.c_str()); return -1; }
+    int temp = -1;
+    try {
+        size_t comma = s.find(',');
+        if (comma == std::string::npos) {
+            temp = std::stoi(s);                      // old driver: temp only
+        } else {
+            temp = std::stoi(trim(s.substr(0, comma)));
+            if (utilOut) *utilOut = std::stoi(trim(s.substr(comma + 1)));
+        }
+    } catch (...) { log("queryTemp: parse failed: %s", s.c_str()); }
+    return temp;
 }
 
 // Returns watts, or -1 on failure. Only used at startup to learn the current
@@ -526,6 +605,35 @@ static int regReadDword(const wchar_t* subkey, const wchar_t* name, int def) {
     return val;
 }
 
+// String persistence — the pinned display identity is a device name.
+static void saveString(const wchar_t* name, const wchar_t* val) {
+    HKEY hKey;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_KEY, 0, nullptr, 0,
+                        KEY_WRITE, nullptr, &hKey, nullptr) == ERROR_SUCCESS) {
+        RegSetValueExW(hKey, name, 0, REG_SZ,
+                       reinterpret_cast<const BYTE*>(val),
+                       static_cast<DWORD>((wcslen(val) + 1) * sizeof(wchar_t)));
+        RegCloseKey(hKey);
+    }
+}
+
+static std::wstring readString(const wchar_t* name) {
+    std::wstring val;
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_KEY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        DWORD size = 0, type = 0;
+        if (RegQueryValueExW(hKey, name, nullptr, &type, nullptr, &size) == ERROR_SUCCESS &&
+            type == REG_SZ && size >= sizeof(wchar_t)) {
+            std::vector<wchar_t> buf(size / sizeof(wchar_t) + 1, L'\0');
+            if (RegQueryValueExW(hKey, name, nullptr, nullptr,
+                                 reinterpret_cast<BYTE*>(buf.data()), &size) == ERROR_SUCCESS)
+                val.assign(buf.data());
+        }
+        RegCloseKey(hKey);
+    }
+    return val;
+}
+
 static void saveTargetTemp(int temp) { saveDword(L"TargetTemp", temp); }
 
 static int loadTargetTemp() {
@@ -547,6 +655,418 @@ static bool loadCpuAuto() {
 }
 
 static void saveCpuAuto(bool on) { saveDword(L"CpuAuto", on ? 1 : 0); }
+
+// Resolution governor preference. Default OFF — a sudden display switch is
+// surprising, so this one is opt-in. Fallback defaults to 2560x1440 ("2K":
+// the sweet spot for borderless games on a 4K desktop).
+static bool loadResAuto() { return regReadDword(REG_KEY, L"ResAuto", 0) != 0; }
+static void saveResAuto(bool on) { saveDword(L"ResAuto", on ? 1 : 0); }
+static int  loadResW() { return regReadDword(REG_KEY, L"ResAutoW", 2560); }
+static int  loadResH() { return regReadDword(REG_KEY, L"ResAutoH", 1440); }
+static void saveResFallback(int w, int h) {
+    saveDword(L"ResAutoW", w);
+    saveDword(L"ResAutoH", h);
+}
+
+// Desktop ("rest") resolution — the governor restores TO this while the
+// feature is on, so it is a real setting, not "whatever the registry said".
+// Learned on first run from the target display's Windows-default mode.
+static void saveResDefault(int w, int h) {
+    saveDword(L"ResDefaultW", w);
+    saveDword(L"ResDefaultH", h);
+}
+
+// Pinned target display (GDI device name, e.g. "\\.\DISPLAY2"). Empty =
+// auto: the largest current display, which on this machine is the real
+// monitor — never the virtual streaming displays.
+static void saveResDisp(const wchar_t* devName) { saveString(L"ResDisp", devName); }
+static std::wstring loadResDisp() { return readString(L"ResDisp"); }
+
+// Engage threshold (GPU utilisation % that arms the source hunt), persisted
+// so a tuned value survives reboots.
+static void saveResOnPct(int pct) { saveDword(L"ResOnPct", pct); }
+static int loadResOnPct() {
+    int v = regReadDword(REG_KEY, L"ResOnPct", RES_ON_PCT);
+    if (v < 5 || v > 100) v = RES_ON_PCT;   // registry garbage → default
+    return v;
+}
+
+// ───────────────────── Displays & mode switching ─────────────────────
+// This machine has REAL monitors AND virtual ones (a streaming driver; the
+// GDI "primary" is virtual) — so the governor targets a USER-SELECTED
+// display by GDI device name, never just "the primary".
+
+struct LiveDisplay {
+    wchar_t       devName[32];   // "\\.\DISPLAY2" — the ChangeDisplaySettingsExW handle
+    std::wstring  label;         // menu text: DISPLAYn · monitor/adapter · mode
+    DWORD         w = 0, h = 0;  // current mode
+    bool          primary = false;
+};
+
+// All GDI displays currently attached to the desktop. Pure Win32 queries
+// (no subprocess) — cheap enough for every menu rebuild and every governor
+// fire. UI thread uses it for the menu, worker thread for actuation.
+static std::vector<LiveDisplay> enumDisplays() {
+    std::vector<LiveDisplay> out;
+    DISPLAY_DEVICEW dd{};
+    for (DWORD i = 0;; i++) {
+        dd.cb = sizeof(dd);
+        if (!EnumDisplayDevicesW(nullptr, i, &dd, 0)) break;
+        if (!(dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) continue;
+        DEVMODEW dm{};
+        dm.dmSize = sizeof(dm);
+        if (!EnumDisplaySettingsW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm)) continue;
+
+        LiveDisplay d;
+        wcsncpy_s(d.devName, dd.DeviceName, _TRUNCATE);
+        d.w = dm.dmPelsWidth;
+        d.h = dm.dmPelsHeight;
+        d.primary = (dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0;
+
+        // Prefer the monitor's model name; virtual displays have no
+        // meaningful monitor entry — fall back to the adapter string.
+        DISPLAY_DEVICEW mon{};
+        mon.cb = sizeof(mon);
+        const wchar_t* who = dd.DeviceString;
+        if (EnumDisplayDevicesW(dd.DeviceName, 0, &mon, 0) && mon.DeviceString[0] &&
+            wcscmp(mon.DeviceString, L"Generic PnP Monitor") != 0)
+            who = mon.DeviceString;
+
+        wchar_t res[48];
+        swprintf_s(res, L" · %ux%u", (unsigned)d.w, (unsigned)d.h);
+        d.label = std::wstring(d.devName + 4) + L" · " + who + res;   // skip "\\.\"
+        if (d.primary) d.label += L" · primary";
+        out.push_back(std::move(d));
+    }
+    return out;
+}
+
+// Which display does the governor act on? A pinned selection wins; with no
+// selection, the largest current mode. Returns nullptr when the PINNED
+// display is not present (caller pauses + logs — never silently switches to
+// a different display) or when nothing is attached.
+static const LiveDisplay* resolveDisplay(const wchar_t* pinned,
+                                         std::vector<LiveDisplay>& scratch) {
+    scratch = enumDisplays();
+    if (pinned && pinned[0]) {
+        for (const auto& d : scratch)
+            if (wcscmp(d.devName, pinned) == 0) return &d;
+        return nullptr;
+    }
+    const LiveDisplay* best = nullptr;
+    for (const auto& d : scratch)
+        if (!best || d.w * d.h > best->w * best->h) best = &d;
+    return best;
+}
+
+// Read the current mode of one display.
+static bool getCurrentMode(const wchar_t* dev, DEVMODEW* dm) {
+    ZeroMemory(dm, sizeof(*dm));
+    dm->dmSize = sizeof(*dm);
+    return EnumDisplaySettingsExW(dev, ENUM_CURRENT_SETTINGS, dm, 0) != 0;
+}
+
+// ─── CCD source-mode switch: the blink-free technique ───
+// ChangeDisplaySettingsExW re-times the PANEL, so the monitor loses sync and
+// blanks for the re-lock (the 2s black screen — measured, both CDS variants).
+// SetDisplayConfig — the CCD API that Windows' own display UI uses, and the
+// exact technique Monitor Profile Switcher is built on (studied: their
+// CCDWrapper.cs, GetSourceName/UseSuppliedDisplayConfig/AllowChanges) — can
+// change the desktop (SOURCE) size while leaving the panel's native TARGET
+// timing alone: GPU scaling on the unchanged signal, no sync loss, no blink.
+// No SDC_SAVE_TO_DATABASE → the change stays temporary: logoff/reboot
+// reverts, same safety model as the CDS calls.
+static bool ccdSetSourceMode(const wchar_t* gdiDev, int w, int h) {
+    UINT32 nPaths = 0, nModes = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &nPaths, &nModes)
+        != ERROR_SUCCESS)
+        return false;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(nPaths);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(nModes);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &nPaths, paths.data(),
+                           &nModes, modes.data(), nullptr) != ERROR_SUCCESS)
+        return false;
+
+    // Find the active path whose GDI view name matches the pinned display.
+    int pathIdx = -1;
+    for (UINT32 i = 0; i < nPaths; i++) {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME sn{};
+        sn.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        sn.header.size = sizeof(sn);
+        sn.header.adapterId = paths[i].sourceInfo.adapterId;
+        sn.header.id        = paths[i].sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&sn.header) != ERROR_SUCCESS) continue;
+        if (_wcsicmp(sn.viewGdiDeviceName, gdiDev) == 0) { pathIdx = (int)i; break; }
+    }
+    if (pathIdx < 0) return false;
+
+    // Mutate the SOURCE (desktop) mode only — panel timing untouched.
+    const LUID    srcAdapter = paths[pathIdx].sourceInfo.adapterId;
+    const UINT32  srcId      = paths[pathIdx].sourceInfo.id;
+    DISPLAYCONFIG_MODE_INFO* src = nullptr;
+    for (UINT32 i = 0; i < nModes; i++) {
+        if (modes[i].infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) continue;
+        if (modes[i].adapterId.LowPart  == srcAdapter.LowPart &&
+            modes[i].adapterId.HighPart == srcAdapter.HighPart &&
+            modes[i].id == srcId) { src = &modes[i]; break; }
+    }
+    if (!src) return false;
+    if (src->sourceMode.width  == static_cast<UINT32>(w) &&
+        src->sourceMode.height == static_cast<UINT32>(h))
+        return true;   // already there — nothing to switch
+
+    src->sourceMode.width  = static_cast<UINT32>(w);
+    src->sourceMode.height = static_cast<UINT32>(h);
+
+    // Apply. First WITHOUT SDC_ALLOW_CHANGES (the driver must not sneak a
+    // timing change past us), then with it as the fallback — the MPS pattern.
+    // NOTE: no SDC_SAVE_TO_DATABASE anywhere — deliberately temporary.
+    LONG st = SetDisplayConfig(nPaths, paths.data(), nModes, modes.data(),
+                               SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG |
+                               SDC_NO_OPTIMIZATION);
+    if (st != ERROR_SUCCESS) {
+        st = SetDisplayConfig(nPaths, paths.data(), nModes, modes.data(),
+                              SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG |
+                              SDC_NO_OPTIMIZATION | SDC_ALLOW_CHANGES);
+    }
+    if (st != ERROR_SUCCESS) {
+        log("res[%ls]: CCD switch to %dx%d failed (status 0x%lX)",
+            gdiDev, w, h, (unsigned long)st);
+        return false;
+    }
+    log("res[%ls]: CCD switch to %dx%d OK (panel timing unchanged — no blink)",
+        gdiDev, w, h);
+    return true;
+}
+
+// Pick a NATIVE supported mode matching w×h, refresh as close to the
+// current one as the panel allows (exact first, then highest ≤ current).
+// Commanding an exact native mode is a single clean timing switch; asking
+// the driver to synthesise one (PELS-only) can add extra blanking.
+static bool findNativeMode(const wchar_t* dev, int w, int h, DEVMODEW* out) {
+    DEVMODEW cur{};
+    if (!getCurrentMode(dev, &cur)) return false;
+    const DWORD wantHz = cur.dmDisplayFrequency;
+    auto score = [wantHz](DWORD hz) -> int {
+        if (hz == wantHz) return 0;                       // exact: no cadence change
+        if (hz > 1 && hz < wantHz) return 1 + static_cast<int>(wantHz - hz);   // highest below
+        return 100000 + static_cast<int>(hz);             // above current: last resort
+    };
+    bool have = false;
+    DEVMODEW best{};
+    for (DWORD i = 0;; i++) {
+        DEVMODEW dm{};
+        dm.dmSize = sizeof(dm);
+        if (!EnumDisplaySettingsExW(dev, i, &dm, 0)) break;
+        if (dm.dmPelsWidth != (DWORD)w || dm.dmPelsHeight != (DWORD)h) continue;
+        if (dm.dmDisplayFlags & DM_INTERLACED) continue;
+        if (dm.dmBitsPerPel && cur.dmBitsPerPel && dm.dmBitsPerPel != cur.dmBitsPerPel)
+            continue;
+        if (dm.dmDisplayFrequency <= 1) continue;         // driver-reported unknown
+        if (!have || score(dm.dmDisplayFrequency) < score(best.dmDisplayFrequency)) {
+            best = dm;
+            have = true;
+        }
+    }
+    if (have) *out = best;
+    return have;
+}
+
+// Switch ONE display to w×h as a TEMPORARY mode change (no registry write —
+// logoff/reboot reverts even if we die mid-drop). Tiers:
+//   1. CCD source-mode switch (SetDisplayConfig): panel timing untouched —
+//      instant, no blink. The normal path.
+//   2. CDS with an exact native mode (findNativeMode) — one timing change.
+//   3. CDS relaxed PELS-only request — driver synthesises.
+// Returns a DISP_CHANGE_* code (CCD success maps to DISP_CHANGE_SUCCESSFUL).
+static LONG applyDisplayMode(const wchar_t* dev, int w, int h) {
+    DEVMODEW cur{};
+    if (!getCurrentMode(dev, &cur)) return DISP_CHANGE_FAILED;
+    if (cur.dmPelsWidth == (DWORD)w && cur.dmPelsHeight == (DWORD)h)
+        return DISP_CHANGE_SUCCESSFUL;   // already there — nothing to do
+    if (ccdSetSourceMode(dev, w, h))
+        return DISP_CHANGE_SUCCESSFUL;
+    DEVMODEW native{};
+    if (findNativeMode(dev, w, h, &native) && native.dmDisplayFrequency > 1) {
+        native.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+        log("res[%ls]: native mode %dx%d @%uHz selected (CDS fallback)", dev, w, h,
+            (unsigned)native.dmDisplayFrequency);
+        LONG rc = ChangeDisplaySettingsExW(dev, &native, nullptr, 0, nullptr);
+        if (rc == DISP_CHANGE_SUCCESSFUL) return rc;
+        // rejected — fall through to the relaxed request
+    }
+    DEVMODEW relaxed = cur;
+    relaxed.dmPelsWidth  = static_cast<DWORD>(w);
+    relaxed.dmPelsHeight = static_cast<DWORD>(h);
+    relaxed.dmFields    |= DM_PELSWIDTH | DM_PELSHEIGHT;
+    return ChangeDisplaySettingsExW(dev, &relaxed, nullptr, 0, nullptr);
+}
+
+// Revert one display to its default (registry) mode. NULL devmode is the
+// documented "revert to default".
+static bool restoreDisplayMode(const wchar_t* dev) {
+    return ChangeDisplaySettingsExW(dev, nullptr, nullptr, 0, nullptr)
+           == DISP_CHANGE_SUCCESSFUL;
+}
+
+// ───────────── GPU load sourcing (Task-Manager-style) ─────────────
+// The resolution governor must tell "a game fills the screen" apart from
+// "background compute is chewing the GPU" (AI inference does the latter for
+// hours). Two ingredients:
+//   1. Per-PID graphics-engine utilisation from the "GPU Engine" performance
+//      counters — the exact data behind Task Manager's GPU column. Games
+//      show under 3D/Graphics_N; CUDA inference shows under Compute and is
+//      invisible here, which is precisely the discrimination we want.
+//   2. A window check: does that PID own a visible, UNDECORATED (borderless)
+//      root window covering ≥95% of the target display? A fullscreen
+//      borderless game does; an AI console, a training notebook or a
+//      windowed tool does not.
+
+struct PidUtil {
+    DWORD pid = 0;
+    int   pct = 0;   // summed graphics-engine utilisation, clamped to 100
+};
+
+// Sums GRAPHICS-engine utilisation per PID: "3D" (classic) plus
+// "Graphics_N" (DX12/Vulkan multi-node — RE Engine, Unreal and friends
+// report Graphics_1, invisible to a naive 3D-only filter). Compute
+// (CUDA/DirectML-independent) deliberately never matches, so AI inference
+// stays unsourced. Worker thread only (blocks ~0.5s for the counter delta).
+// Returns false when the counters are unavailable — the caller then refuses
+// to engage (no sourcing → no drop, by design).
+static bool queryGfxUtilByPid(std::vector<PidUtil>& out) {
+    out.clear();
+    PDH_HQUERY q = nullptr;
+    if (PdhOpenQueryW(nullptr, 0, &q) != ERROR_SUCCESS) return false;
+
+    // Expand "\GPU Engine(*)\Utilization Percentage" into concrete
+    // instances; each path embeds pid_N…engtype_X. Two-call pattern:
+    // NULL buffer → PDH_MORE_DATA + required size; allocate; retry.
+    DWORD need = 0;
+    if (PdhExpandCounterPathW(L"\\GPU Engine(*)\\Utilization Percentage",
+                              nullptr, &need) != PDH_MORE_DATA || !need) {
+        PdhCloseQuery(q);
+        return false;
+    }
+    std::vector<wchar_t> buf(need, L'\0');
+    if (PdhExpandCounterPathW(L"\\GPU Engine(*)\\Utilization Percentage",
+                              buf.data(), &need) != ERROR_SUCCESS) {
+        PdhCloseQuery(q);
+        return false;
+    }
+    LPWSTR list = buf.data();
+
+    std::vector<std::pair<PDH_HCOUNTER, DWORD>> added;
+    for (LPWSTR p = list; *p; p += wcslen(p) + 1) {
+        // Graphics engines only — see the function comment for why both.
+        if (!wcsstr(p, L"engtype_3D") && !wcsstr(p, L"engtype_Graphics"))
+            continue;
+        const wchar_t* pidTag = wcsstr(p, L"pid_");
+        if (!pidTag) continue;
+        DWORD pid = wcstoul(pidTag + 4, nullptr, 10);
+        if (!pid) continue;
+        PDH_HCOUNTER c = nullptr;
+        if (PdhAddCounterW(q, p, 0, &c) != ERROR_SUCCESS) continue;
+        added.emplace_back(c, pid);
+    }
+    if (added.empty()) { PdhCloseQuery(q); return false; }
+
+    // These counters report the busy fraction of the last interval; PDH
+    // formats them as a plain percentage after two collections.
+    PdhCollectQueryData(q);
+    Sleep(500);
+    PdhCollectQueryData(q);
+
+    bool any = false;
+    for (const auto& e : added) {
+        PDH_FMT_COUNTERVALUE v{};
+        if (PdhGetFormattedCounterValue(e.first,
+                                        PDH_FMT_DOUBLE | PDH_FMT_NOCAP100,
+                                        nullptr, &v) != ERROR_SUCCESS)
+            continue;
+        if (v.doubleValue <= 0.0) continue;
+        any = true;
+        auto it = std::find_if(out.begin(), out.end(),
+            [&](const PidUtil& pu) { return pu.pid == e.second; });
+        const int add = static_cast<int>(v.doubleValue + 0.5);
+        if (it == out.end()) out.push_back({ e.second, add });
+        else                 it->pct += add;
+    }
+    PdhCloseQuery(q);
+    for (auto& pu : out) pu.pct = std::min(100, pu.pct);
+    return any;
+}
+
+// HMONITOR of a GDI device name ("\\.\DISPLAY1"), or nullptr.
+struct MonCtx { const wchar_t* devName; HMONITOR hmon; };
+static BOOL CALLBACK findMonitorCb(HMONITOR hmon, HDC, LPRECT, LPARAM lp) {
+    auto* ctx = reinterpret_cast<MonCtx*>(lp);
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(hmon, &mi) && wcscmp(mi.szDevice, ctx->devName) == 0) {
+        ctx->hmon = hmon;
+        return FALSE;   // found — stop enumeration
+    }
+    return TRUE;
+}
+static HMONITOR monitorForDevice(const wchar_t* devName) {
+    MonCtx ctx{ devName, nullptr };
+    EnumDisplayMonitors(nullptr, nullptr, findMonitorCb,
+                        reinterpret_cast<LPARAM>(&ctx));
+    return ctx.hmon;
+}
+
+struct WinCtx { DWORD pid; HMONITOR hmon; HWND found; };
+
+// Accepts a top-level, visible, non-minimised, UNDECORATED window that
+// covers ≥95% of the target monitor — i.e. a borderless fullscreen surface.
+// Decorated windows (WS_CAPTION/WS_THICKFRAME — a maximised browser, a
+// windowed game) never qualify.
+static BOOL CALLBACK findBorderlessCb(HWND hwnd, LPARAM lp) {
+    auto* ctx = reinterpret_cast<WinCtx*>(lp);
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != ctx->pid) return TRUE;
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return TRUE;
+    if (GetAncestor(hwnd, GA_ROOT) != hwnd) return TRUE;               // top-level only
+    const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    if (style & (WS_CAPTION | WS_THICKFRAME)) return TRUE;             // decorated
+    if (MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) != ctx->hmon) return TRUE;
+
+    RECT wr{}, mr{};
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (!GetWindowRect(hwnd, &wr) || !GetMonitorInfoW(ctx->hmon, &mi)) return TRUE;
+    const RECT& r = mi.rcMonitor;
+    const LONG ix = std::max(wr.left, r.left), iy = std::max(wr.top, r.top);
+    const LONG ax = std::min(wr.right, r.right), ay = std::min(wr.bottom, r.bottom);
+    const LONG iw = ax - ix, ih = ay - iy;
+    if (iw <= 0 || ih <= 0) return TRUE;
+    const LONGLONG cover = static_cast<LONGLONG>(iw) * ih;
+    const LONGLONG monA = static_cast<LONGLONG>(r.right - r.left) * (r.bottom - r.top);
+    if (cover * 20 < monA * 19) return TRUE;   // <95% coverage — not fullscreen
+    ctx->found = hwnd;
+    return FALSE;   // found — stop enumeration
+}
+
+static bool pidHasBorderlessFullscreenOn(DWORD pid, HMONITOR hmon) {
+    WinCtx ctx{ pid, hmon, nullptr };
+    EnumWindows(findBorderlessCb, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.found != nullptr;
+}
+
+// Short ANSI basename of a process image for log lines.
+static void logProcessName(HANDLE h, char* out, size_t cap) {
+    wchar_t exe[260] = L"";
+    DWORD len = 260;
+    strcpy_s(out, cap, "?");
+    if (QueryFullProcessImageNameW(h, 0, exe, &len)) {
+        const wchar_t* base = wcsrchr(exe, L'\\');
+        base = base ? base + 1 : exe;
+        WideCharToMultiByte(CP_UTF8, 0, base, -1, out,
+                            static_cast<int>(cap), nullptr, nullptr);
+    }
+}
 
 // ───────────────────────── Controller ─────────────────────────
 //
@@ -663,6 +1183,15 @@ struct SharedState {
     volatile int  cpuMode      = CPU_MODE_AUTO;  // UI → worker: governor mode
     volatile int  cpuUsage     = -1;             // worker → UI: total CPU load %
     volatile int  cpuState     = 0;              // worker → UI: applied AC max
+    volatile int  gpuUtil      = -1;             // worker → UI: GPU utilisation %
+    volatile int  resAuto      = 0;              // UI → worker: resolution governor on
+    volatile int  resTargetW   = 2560;           // UI → worker: game (fallback) resolution
+    volatile int  resTargetH   = 1440;
+    volatile int  resDefaultW  = 0;              // UI → worker: desktop (rest) resolution
+    volatile int  resDefaultH  = 0;              //   (learned at startup; 0 = unknown)
+    volatile int  resOnPct     = RES_ON_PCT;     // UI → worker: engage threshold %
+    volatile int  resEngaged   = 0;              // worker → UI: display currently dropped
+    wchar_t       resDisp[32]{};                 // UI → worker: pinned display; empty = auto
     volatile bool initDone     = false;
     volatile bool trayDirty    = false;
     wchar_t       trayTip[128]{};
@@ -776,9 +1305,10 @@ struct CpuGov {
 };
 static CpuGov g_cpu;
 
-static void cpuTick() {
-    const int usage = queryCpuUsagePct();
-    const int fg    = queryForegroundPct();
+// usage/fg are sampled ONCE per worker iteration (workerMain) and passed in —
+// both queries keep delta state, so calling them twice per iteration would
+// corrupt the second reading (resTick needs the same foreground signal).
+static void cpuTick(int usage, int fg) {
     const int want  = g_shared.cpuMode;
 
     if (want != g_cpu.want) {
@@ -842,6 +1372,363 @@ static void cpuTick() {
     LeaveCriticalSection(&g_cs);
 }
 
+// ───────────────────── Resolution governor ─────────────────────
+// Owns the SELECTED display's resolution while enabled (opt-in). ENGAGE:
+// sustained heavy GPU load (≥ ResOnPct, default RES_ON_PCT, for RES_ON_MS)
+// that can be SOURCED to an application holding a borderless fullscreen
+// window on that display → drop to the game resolution. RELEASE: only when that application exits
+// (process handle fires) — pauses, alt-tab and menus never flip-flop.
+// While NOT dropped, three-signal sustained quiet (see RES_OFF_MS) enforces
+// the configured desktop resolution, so any startup/manual odd state
+// converges. All display work lives on this worker thread like every other
+// blocking external call (a mode switch briefly broadcasts WM_DISPLAYCHANGE).
+
+// Restore the managed display to the configured desktop resolution, falling
+// back to its registry default when the configured one is unset or
+// rejected. `disp` may be nullptr (pinned display missing / nothing
+// attached) — then nothing happens. Used by the worker AND the UI exit path.
+static bool restoreToDefault(const LiveDisplay* disp) {
+    if (!disp) return false;
+    const int dw = g_shared.resDefaultW, dh = g_shared.resDefaultH;
+    if (dw > 0 && dh > 0 &&
+        applyDisplayMode(disp->devName, dw, dh) == DISP_CHANGE_SUCCESSFUL)
+        return true;
+    return restoreDisplayMode(disp->devName);
+}
+
+// Governor state — worker thread only.
+struct ResGov {
+    int       want     = -1;   // last seen UI flag (-1 = not seen yet)
+    int       lastW = 0, lastH = 0;        // last seen game resolution
+    int       lastDefW = 0, lastDefH = 0;  // last seen desktop resolution
+    bool      engaged  = false;   // display currently dropped
+    bool      badFallback = false;  // driver rejected the game resolution
+    bool      badDefault  = false;  // driver rejected the desktop resolution
+    bool      naLogged    = false;  // "at/below game res" logged once per load period
+    bool      srcLogged   = false;  // "heavy but unsourced" logged once per load period
+    bool      missingLogged = false;// pinned display absent — logged once per absence
+    bool      deathLogged   = false;// source-exited logged once (restore may retry)
+    ULONGLONG hotSince = 0;   // sustained heavy load → drop attempt
+    ULONGLONG normSince  = 0; // sustained all-quiet while quiet → enforce desktop res
+    // Source tracking: the app we dropped FOR. Its lifetime is the ONLY
+    // release trigger. The HANDLE (not the pid) survives pid reuse.
+    HANDLE    srcProcess = nullptr;
+    DWORD     srcPid     = 0;
+    char      srcName[64] = "?";
+};
+static ResGov g_res;
+
+static void endSourceTracking() {
+    if (g_res.srcProcess) { CloseHandle(g_res.srcProcess); g_res.srcProcess = nullptr; }
+    g_res.srcPid = 0;
+    g_res.srcName[0] = '\0';
+    g_res.deathLogged = false;
+}
+
+// UI-side synchronous restore (IDM_EXIT). Pure GDI — no subprocess, safe on
+// the UI thread, same pattern as resetClocks/applyCpuState at exit. Also
+// clears the worker's engagement state: at Exit the worker is on its way
+// out (quitEvent is set right after the message loop), and leaving it set
+// would make the shutdown path double-restore.
+static void restoreResolutionNow() {
+    if (!g_shared.resEngaged) return;
+    std::vector<LiveDisplay> scratch;
+    const LiveDisplay* disp = resolveDisplay(g_shared.resDisp, scratch);
+    if (!disp) { log("res: exit — target display not present, nothing to restore"); return; }
+    if (restoreToDefault(disp)) {
+        g_shared.resEngaged = 0;
+        g_res.engaged = false;
+        endSourceTracking();
+        log("res[%ls]: exit → desktop resolution restored", disp->devName);
+    } else {
+        log("res[%ls]: exit → restore FAILED", disp->devName);
+    }
+}
+
+static void resTick(int util, int fg) {
+    const int want  = g_shared.resAuto;
+    const int tw    = g_shared.resTargetW,  th   = g_shared.resTargetH;
+    const int dw    = g_shared.resDefaultW, dh   = g_shared.resDefaultH;
+    const int onPct = g_shared.resOnPct;   // engage threshold (user-tunable)
+
+    // Reconcile against the UI's settings (mirrors cpuTick's mode handling).
+    if (want != g_res.want || tw != g_res.lastW || th != g_res.lastH ||
+        dw != g_res.lastDefW || dh != g_res.lastDefH) {
+        const bool first = (g_res.want < 0);
+        if (!first)
+            log("res: config → %s, game %dx%d, desktop %dx%d",
+                want ? "on" : "off", tw, th, dw, dh);
+        const bool wasEngaged = g_res.engaged;
+        g_res.want = want;
+        g_res.lastW = tw;    g_res.lastH = th;
+        g_res.lastDefW = dw; g_res.lastDefH = dh;
+        g_res.badFallback = false; g_res.badDefault = false;
+        g_res.naLogged = false; g_res.srcLogged = false;
+        g_res.hotSince = g_res.normSince = 0;
+        if (wasEngaged && !want) {
+            // Feature off while dropped: hand the display back at the
+            // configured desktop resolution (or registry default).
+            std::vector<LiveDisplay> scratch;
+            if (restoreToDefault(resolveDisplay(g_shared.resDisp, scratch))) {
+                g_res.engaged = false;
+                endSourceTracking();
+                log("res: feature off → desktop resolution restored");
+            }
+        } else if (wasEngaged) {
+            // Game resolution changed while dropped: re-apply in place (one
+            // mode switch) instead of restore-then-re-engage (two). The
+            // source keeps running — the drop survives.
+            std::vector<LiveDisplay> scratch;
+            const LiveDisplay* disp = resolveDisplay(g_shared.resDisp, scratch);
+            LONG rc = disp ? applyDisplayMode(disp->devName, tw, th)
+                           : DISP_CHANGE_FAILED;
+            if (rc == DISP_CHANGE_SUCCESSFUL) {
+                log("res: game resolution changed → re-applied %dx%d", tw, th);
+            } else {
+                restoreToDefault(disp);   // never leave it dropped and wrong
+                g_res.engaged = false;
+                endSourceTracking();
+                log("res: game resolution changed → re-apply failed (rc=%ld), desktop restored", rc);
+            }
+        }
+    }
+
+    if (!want || util < 0) return;   // off, or no GPU reading: never act blind
+
+    const ULONGLONG now = GetTickCount64();
+    // All-quiet (used only while NOT dropped, for desktop normalisation):
+    // low GPU util AND quiet foreground AND total CPU below the busy floor.
+    const bool allQuiet = util <= RES_OFF_PCT &&
+                          fg >= 0 && fg <= FG_OFF_PCT &&
+                          g_shared.cpuUsage >= 0 &&
+                          g_shared.cpuUsage < CPU_USAGE_ON_PCT;
+
+    if (g_res.engaged) {
+        // HOLD. The sourced application's lifetime is the only release
+        // trigger: pausing, alt-tab, loading screens, fps dips — nothing
+        // else flips the resolution back (that was the flip-flop bug).
+        const bool sourceAlive = g_res.srcProcess &&
+            WaitForSingleObject(g_res.srcProcess, 0) != WAIT_OBJECT_0;
+        if (sourceAlive) return;   // stay dropped — ignore util/fg/CPU entirely
+
+        std::vector<LiveDisplay> scratch;
+        const LiveDisplay* disp = resolveDisplay(g_shared.resDisp, scratch);
+        if (!disp) {
+            if (!g_res.missingLogged) {
+                g_res.missingLogged = true;
+                log("res: target display %ls not present — restore paused"
+                    " until it reappears", g_shared.resDisp);
+            }
+            return;   // retry next tick
+        }
+        g_res.missingLogged = false;
+        if (!g_res.deathLogged) {
+            g_res.deathLogged = true;
+            log("res[%ls]: source %s (pid %lu) exited → restoring desktop"
+                " resolution %dx%d",
+                disp->devName, g_res.srcName[0] ? g_res.srcName : "process",
+                g_res.srcPid, dw, dh);
+        }
+        if (restoreToDefault(disp)) {
+            g_res.engaged = false;
+            endSourceTracking();
+            g_res.normSince = 0;
+        }   // else: retry next tick (engaged stays true)
+        return;
+    }
+
+    // Quiet state: two independent watches — sourced-heavy→drop,
+    // quiet→enforce desktop res.
+    if (util >= onPct) {
+        g_res.normSince = 0;                       // load resets the enforce window
+        if (!g_res.hotSince) g_res.hotSince = now;
+        if (now - g_res.hotSince < RES_ON_MS) return;
+        if (g_res.badFallback || g_res.naLogged || g_res.srcLogged) {
+            g_res.hotSince = now;   // already refused this load period — retry silently
+            return;
+        }
+
+        std::vector<LiveDisplay> scratch;
+        const LiveDisplay* disp = resolveDisplay(g_shared.resDisp, scratch);
+        if (!disp) {
+            if (!g_res.missingLogged) {
+                g_res.missingLogged = true;
+                if (g_shared.resDisp[0])
+                    log("res: target display %ls not present — not engaging"
+                        " (paused until it reappears, or re-pick in the menu)",
+                        g_shared.resDisp);
+                else
+                    log("res: no displays attached — not engaging");
+            }
+            g_res.hotSince = now;
+            return;
+        }
+        g_res.missingLogged = false;
+
+        DEVMODEW cur{};
+        if (!getCurrentMode(disp->devName, &cur)) {
+            log("res[%ls]: cannot read the current mode — not engaging", disp->devName);
+            g_res.hotSince = now;   // retry a full window later
+            return;
+        }
+        if ((int)cur.dmPelsWidth <= tw) {
+            // Target display already at/below the game resolution — nothing
+            // to drop. A TRUE-exclusive fullscreen game changes the mode
+            // itself and lands here: exclusive stays self-managed.
+            g_res.naLogged = true;
+            log("res[%ls]: at %dx%d ≤ game %dx%d — nothing to drop",
+                disp->devName, (int)cur.dmPelsWidth, (int)cur.dmPelsHeight, tw, th);
+            g_res.hotSince = now;
+            return;
+        }
+
+        // Source the load: is any SUBSTANTIAL graphics consumer holding a
+        // borderless fullscreen on the target display? Deliberately NOT
+        // "the single top consumer" — background Chrome/WebGL can out-rank
+        // a fullscreen game (observed live: chrome 89% vs game 78%); the
+        // game is the one FILLING the screen, so the window decides.
+        std::vector<PidUtil> per;
+        if (!queryGfxUtilByPid(per)) {
+            g_res.srcLogged = true;
+            log("res: GPU Engine counters unavailable — cannot source the"
+                " load, not dropping");
+            g_res.hotSince = now;
+            return;
+        }
+        std::sort(per.begin(), per.end(),
+                  [](const PidUtil& a, const PidUtil& b) { return a.pct > b.pct; });
+        HMONITOR hmon = monitorForDevice(disp->devName);
+        if (!hmon) { g_res.hotSince = now; return; }
+        const int srcMin = std::min(GFX_SRC_MIN_PCT, onPct / 2);
+        DWORD srcPid = 0; int srcPct = 0;
+        for (const auto& pu : per) {
+            if (pu.pct < srcMin) break;   // sorted desc — the rest is noise
+            if (!pidHasBorderlessFullscreenOn(pu.pid, hmon)) continue;
+            srcPid = pu.pid; srcPct = pu.pct;
+            break;
+        }
+        if (!srcPid) {
+            g_res.srcLogged = true;
+            if (per.empty()) {
+                log("res: GPU %d%% but no graphics consumer found (compute-only"
+                    " load — AI inference?) — not dropping", util);
+            } else {
+                char tops[128] = "";
+                const size_t n = std::min<size_t>(per.size(), 3);
+                for (size_t i = 0; i < n; i++) {
+                    char nm[48] = "?";
+                    HANDLE ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                                            FALSE, per[i].pid);
+                    if (ph) { logProcessName(ph, nm, sizeof(nm)); CloseHandle(ph); }
+                    char piece[72];
+                    snprintf(piece, sizeof(piece), "%s%s %d%%",
+                             i ? ", " : "", nm, per[i].pct);
+                    strncat_s(tops, piece, _TRUNCATE);
+                }
+                log("res: GPU %d%% but none of the loaded processes (%s) holds"
+                    " a borderless fullscreen on %ls — background compute/"
+                    "render, not a game — not dropping",
+                    util, tops, disp->devName);
+            }
+            g_res.hotSince = now;
+            return;
+        }
+
+        // Lifetime handle: survives pid reuse, signals on exit.
+        HANDLE h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                               FALSE, srcPid);
+        if (!h) {
+            log("res: cannot open source pid %lu — cannot track it, not dropping", srcPid);
+            g_res.hotSince = now;
+            return;
+        }
+        char exe[64];
+        logProcessName(h, exe, sizeof(exe));
+
+        log("res[%ls]: GPU %d%% sustained %ds sourced to %s (pid %lu, %d%% gfx,"
+            " borderless fullscreen) → game resolution %dx%d → %dx%d",
+            disp->devName, util, RES_ON_MS / 1000, exe, srcPid, srcPct,
+            (int)cur.dmPelsWidth, (int)cur.dmPelsHeight, tw, th);
+        LONG rc = applyDisplayMode(disp->devName, tw, th);
+        if (rc == DISP_CHANGE_SUCCESSFUL) {
+            g_res.engaged    = true;
+            g_res.srcProcess = h;
+            g_res.srcPid     = srcPid;
+            strncpy_s(g_res.srcName, exe, _TRUNCATE);
+            g_res.hotSince  = 0;
+            g_res.normSince = 0;
+        } else {
+            CloseHandle(h);
+            g_res.hotSince = now;   // retry a full window later
+            if (rc == DISP_CHANGE_BADMODE) {
+                // Permanent for this target: stop retrying until the setting
+                // changes (each retry would flicker the display for nothing).
+                g_res.badFallback = true;
+                log("res[%ls]: %dx%d rejected by the driver (DISP_CHANGE_BADMODE)"
+                    " — suspended until the game-resolution setting changes",
+                    disp->devName, tw, th);
+            } else {
+                log("res[%ls]: drop failed (rc=%ld) — retrying next window",
+                    disp->devName, rc);
+            }
+        }
+        return;
+    }
+
+    // Not heavy.
+    g_res.hotSince = 0;
+    g_res.naLogged = false;
+    g_res.srcLogged = false;
+    if (!allQuiet) { g_res.normSince = 0; return; }
+
+    // Sustained quiet while not dropped: enforce the configured desktop
+    // resolution. This is what makes the startup resolution irrelevant.
+    if (!g_res.normSince) g_res.normSince = now;
+    if (now - g_res.normSince < RES_OFF_MS) return;
+    if (g_res.badDefault || dw <= 0 || dh <= 0) return;
+
+    std::vector<LiveDisplay> scratch;
+    const LiveDisplay* disp = resolveDisplay(g_shared.resDisp, scratch);
+    if (!disp) {
+        if (!g_res.missingLogged) {
+            g_res.missingLogged = true;
+            if (g_shared.resDisp[0])
+                log("res: target display %ls not present — desktop-resolution"
+                    " enforcement paused until it reappears", g_shared.resDisp);
+            else
+                log("res: no displays attached — desktop-resolution enforcement paused");
+        }
+        g_res.normSince = now;
+        return;
+    }
+    g_res.missingLogged = false;
+
+    DEVMODEW cur{};
+    if (!getCurrentMode(disp->devName, &cur)) { g_res.normSince = now; return; }
+    if (cur.dmPelsWidth == (DWORD)dw && cur.dmPelsHeight == (DWORD)dh) {
+        g_res.normSince = 0;   // already at the desktop resolution
+        return;
+    }
+    log("res[%ls]: quiet, at %dx%d ≠ desktop default %dx%d → applying"
+        " desktop resolution",
+        disp->devName, (int)cur.dmPelsWidth, (int)cur.dmPelsHeight, dw, dh);
+    LONG rc = applyDisplayMode(disp->devName, dw, dh);
+    if (rc == DISP_CHANGE_SUCCESSFUL) {
+        g_res.normSince = 0;
+    } else {
+        g_res.normSince = now;
+        if (rc == DISP_CHANGE_BADMODE) {
+            g_res.badDefault = true;
+            log("res[%ls]: desktop %dx%d rejected by the driver"
+                " (DISP_CHANGE_BADMODE) — suspended until the setting changes",
+                disp->devName, dw, dh);
+        } else {
+            log("res[%ls]: apply desktop resolution failed (rc=%ld)"
+                " — retrying next window", disp->devName, rc);
+        }
+    }
+}
+
 // ───────────────────────── Tray icon management ─────────────────────────
 // Icon creation + Shell_NotifyIcon are worker-owned (they can block on a
 // wedged explorer). The UI only requests a refresh via requestTrayRefresh().
@@ -866,6 +1753,53 @@ static const Preset g_presets[] = {
     { IDM_INF, -1,  L"\u221E (max power)"   },
 };
 
+// Fallback resolution presets (table-driven like g_presets — extend the
+// table, not if-branches). Only ever applied when the current desktop is
+// LARGER, so entries must stay below the resolutions users actually run.
+struct ResPreset {
+    UINT          cmdId;
+    int           w, h;
+    const wchar_t* label;
+};
+
+// Game (fallback) resolution presets — applied under heavy GPU load.
+static const ResPreset g_resPresets[] = {
+    { IDM_RES_1440P, 2560, 1440, L"2560 \u00D7 1440" },
+    { IDM_RES_1080P, 1920, 1080, L"1920 \u00D7 1080" },
+};
+
+// Desktop (rest) resolution presets — what the governor restores TO. The
+// setting is learned from the target display's Windows-default mode on
+// first run; these entries let the user pin it explicitly.
+static const ResPreset g_defResPresets[] = {
+    { IDM_RES_DEF_4K,    3840, 2160, L"3840 \u00D7 2160" },
+    { IDM_RES_DEF_1440P, 2560, 1440, L"2560 \u00D7 1440" },
+    { IDM_RES_DEF_1080P, 1920, 1080, L"1920 \u00D7 1080" },
+};
+
+// GPU load thresholds that arm the source hunt (persisted ResOnPct). Light
+// games vsync-capped at 25-50%; saturated titles at 75-90%.
+struct PctPreset {
+    UINT           cmdId;
+    int            pct;
+    const wchar_t* label;
+};
+
+static const PctPreset g_pctPresets[] = {
+    { IDM_RES_PCT_25, 25, L"25 %  (catch light games)" },
+    { IDM_RES_PCT_50, 50, L"50 %" },
+    { IDM_RES_PCT_66, 66, L"66 %  (default)" },
+    { IDM_RES_PCT_75, 75, L"75 %" },
+    { IDM_RES_PCT_90, 90, L"90 %  (saturated only)" },
+};
+
+// Live display snapshot taken at menu-open; WM_COMMAND dispatch (also on the
+// UI thread) indexes this same vector, so the choice always matches what the
+// user actually saw. GDI display numbering can change across reboots and
+// hotplugs — that's fine: the menu is rebuilt on every open and shows the
+// current truth.
+static std::vector<LiveDisplay> g_menuDisplays;
+
 static std::wstring targetLabel() {
     if (g_ctrl.targetTemp == 0)  return L"Off";
     if (g_ctrl.targetTemp == -1) return L"\u221E";
@@ -888,7 +1822,7 @@ static std::wstring buildTipText() {
     s += (g_lastTemp >= 0) ? std::to_wstring(g_lastTemp) + L"\u00B0C" : L"--";
     s += L"\nCap: ";
     s += (g_ctrl.capMhz > 0) ? std::to_wstring(g_ctrl.capMhz) + L" MHz" : L"none";
-    if (g_ctrl.cliffMhz > 0)
+    if (g_ctrl.cliffMhz > 0 && !g_shared.resEngaged)
         s += L" (cliff " + std::to_wstring(g_ctrl.cliffMhz) + L" MHz)";
     s += L"\nTarget: " + targetLabel();
     // CPU governor — kept compact; the tray tooltip caps at 128 chars.
@@ -902,6 +1836,12 @@ static std::wstring buildTipText() {
         s += L"\nCPU: …";
     if (g_shared.cpuUsage >= 0)
         s += L" · " + std::to_wstring(g_shared.cpuUsage) + L"% load";
+    // Resolution governor — only while it owns the display (the tray
+    // tooltip caps at 128 chars and is already tight; the cliff info is
+    // suppressed above to make room).
+    if (g_shared.resEngaged)
+        s += L"\nRes: " + std::to_wstring(g_shared.resTargetW) + L"×"
+           + std::to_wstring(g_shared.resTargetH) + L" (game)";
     return s;
 }
 
@@ -928,6 +1868,65 @@ static void rebuildMenu() {
     UINT cpuOffFlags  = MF_STRING | (g_shared.cpuMode == CPU_MODE_OFF  ? MF_CHECKED : 0);
     AppendMenuW(g_hMenu, cpuAutoFlags, IDM_CPU_AUTO, L"CPU: auto (cool idle, boost on load)");
     AppendMenuW(g_hMenu, cpuOffFlags,  IDM_CPU_OFF,  L"CPU: off (leave at 100%)");
+
+    AppendMenuW(g_hMenu, MF_SEPARATOR, 0, nullptr);
+
+    // Resolution governor: toggle + game/desktop resolution + target display.
+    AppendMenuW(g_hMenu,
+                MF_STRING | (g_shared.resAuto ? MF_CHECKED : 0),
+                IDM_RES_AUTO, L"Display: drop to game res on heavy GPU load");
+    {
+        HMENU gameSub = CreatePopupMenu();
+        for (const auto& rp : g_resPresets) {
+            UINT flags = MF_STRING;
+            if (g_shared.resTargetW == rp.w && g_shared.resTargetH == rp.h)
+                flags |= MF_CHECKED;
+            AppendMenuW(gameSub, flags, rp.cmdId, rp.label);
+        }
+        wchar_t lbl[96];
+        swprintf_s(lbl, L"Game resolution (%ux%u)",
+                   (unsigned)g_shared.resTargetW, (unsigned)g_shared.resTargetH);
+        // DestroyMenu(g_hMenu) at rebuild recursively destroys the submenus.
+        AppendMenuW(g_hMenu, MF_POPUP, (UINT_PTR)gameSub, lbl);
+
+        HMENU deskSub = CreatePopupMenu();
+        for (const auto& rp : g_defResPresets) {
+            UINT flags = MF_STRING;
+            if (g_shared.resDefaultW == rp.w && g_shared.resDefaultH == rp.h)
+                flags |= MF_CHECKED;
+            AppendMenuW(deskSub, flags, rp.cmdId, rp.label);
+        }
+        swprintf_s(lbl, L"Desktop resolution (%ux%u)",
+                   (unsigned)g_shared.resDefaultW, (unsigned)g_shared.resDefaultH);
+        AppendMenuW(g_hMenu, MF_POPUP, (UINT_PTR)deskSub, lbl);
+
+        HMENU dispSub = CreatePopupMenu();
+        AppendMenuW(dispSub, MF_STRING | (!g_shared.resDisp[0] ? MF_CHECKED : 0),
+                    IDM_RES_DISP_AUTO, L"Auto (largest display)");
+        g_menuDisplays = enumDisplays();
+        for (size_t i = 0; i < g_menuDisplays.size() && i < 16; i++) {
+            const auto& d = g_menuDisplays[i];
+            UINT flags = MF_STRING;
+            if (g_shared.resDisp[0] && wcscmp(g_shared.resDisp, d.devName) == 0)
+                flags |= MF_CHECKED;
+            AppendMenuW(dispSub, flags, IDM_RES_DISP_BASE + (UINT)i, d.label.c_str());
+        }
+        if (g_shared.resDisp[0])
+            swprintf_s(lbl, L"Target display (%ls)", g_shared.resDisp);
+        else
+            swprintf_s(lbl, L"Target display (auto)");
+        AppendMenuW(g_hMenu, MF_POPUP, (UINT_PTR)dispSub, lbl);
+
+        HMENU pctSub = CreatePopupMenu();
+        for (const auto& pp : g_pctPresets) {
+            UINT flags = MF_STRING;
+            if (g_shared.resOnPct == pp.pct)
+                flags |= MF_CHECKED;
+            AppendMenuW(pctSub, flags, pp.cmdId, pp.label);
+        }
+        swprintf_s(lbl, L"Engage at GPU load (%u%%)", (unsigned)g_shared.resOnPct);
+        AppendMenuW(g_hMenu, MF_POPUP, (UINT_PTR)pctSub, lbl);
+    }
 
     AppendMenuW(g_hMenu, MF_SEPARATOR, 0, nullptr);
 
@@ -1083,7 +2082,8 @@ static DWORD WINAPI workerMain(LPVOID) {
     int       paintUsage   = -1;
     ULONGLONG lastTrayEnsure = GetTickCount64();   // periodic tray self-heal
     while (WaitForSingleObject(g_quitEvent, 0) != WAIT_OBJECT_0) {
-        int temp = queryTemp();
+        int util = -1;
+        int temp = queryTempUtil(&util);
 
         // Pick up commands from the UI.
         int pendC = 0;
@@ -1102,13 +2102,20 @@ static DWORD WINAPI workerMain(LPVOID) {
                 EnterCriticalSection(&g_cs); g_shared.capDone = -pendC; LeaveCriticalSection(&g_cs);  // negative = failed
             }
         }
-        // CPU boost governor — sensing + powercfg live on this thread.
-        cpuTick();
+        // CPU boost governor + resolution governor — sensing and every
+        // blocking external call live on this thread. usage/fg are sampled
+        // once per iteration and shared by both governors.
+        const int usage = queryCpuUsagePct();
+        const int fg    = queryForegroundPct();
+        cpuTick(usage, fg);
+        resTick(util, fg);
 
         // Publish readings for the UI tick.
         {
             EnterCriticalSection(&g_cs);
-            g_shared.temp = temp;
+            g_shared.temp       = temp;
+            g_shared.gpuUtil    = util;
+            g_shared.resEngaged = g_res.engaged ? 1 : 0;
             LeaveCriticalSection(&g_cs);
         }
 
@@ -1180,6 +2187,14 @@ static DWORD WINAPI workerMain(LPVOID) {
         }
         Sleep(200);   // light pacing; the queries above take ~0.5-1s themselves
     }
+    // Back-door shutdown (not the Exit menu item — that restores on the UI
+    // thread): never leave the display dropped.
+    if (g_res.engaged) {
+        std::vector<LiveDisplay> scratch;
+        if (restoreToDefault(resolveDisplay(g_shared.resDisp, scratch)))
+            log("res: shutdown → desktop resolution restored");
+    }
+    endSourceTracking();
     return 0;
 }
 
@@ -1270,6 +2285,59 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             log("menu: CPU governor %s", on ? "auto" : "off");
             return 0;
         }
+        if (id == IDM_RES_AUTO) {
+            bool on = !g_shared.resAuto;   // toggle
+            g_shared.resAuto = on ? 1 : 0;
+            saveResAuto(on);
+            log("menu: resolution governor %s", on ? "on" : "off");
+            return 0;
+        }
+        for (const auto& rp : g_resPresets) {
+            if (id == rp.cmdId) {
+                g_shared.resTargetW = rp.w;
+                g_shared.resTargetH = rp.h;
+                saveResFallback(rp.w, rp.h);
+                log("menu: game resolution %dx%d", rp.w, rp.h);
+                return 0;
+            }
+        }
+        for (const auto& rp : g_defResPresets) {
+            if (id == rp.cmdId) {
+                g_shared.resDefaultW = rp.w;
+                g_shared.resDefaultH = rp.h;
+                saveResDefault(rp.w, rp.h);
+                log("menu: desktop resolution %dx%d", rp.w, rp.h);
+                return 0;
+            }
+        }
+        for (const auto& pp : g_pctPresets) {
+            if (id == pp.cmdId) {
+                g_shared.resOnPct = pp.pct;
+                saveResOnPct(pp.pct);
+                log("menu: engage threshold → %d%% GPU", pp.pct);
+                return 0;
+            }
+        }
+        if (id == IDM_RES_DISP_AUTO) {
+            EnterCriticalSection(&g_cs);
+            g_shared.resDisp[0] = L'\0';
+            LeaveCriticalSection(&g_cs);
+            saveResDisp(L"");
+            log("menu: target display → auto (largest)");
+            return 0;
+        }
+        if (id >= IDM_RES_DISP_BASE && id < IDM_RES_DISP_BASE + 16) {
+            size_t idx = id - IDM_RES_DISP_BASE;
+            if (idx < g_menuDisplays.size()) {
+                const auto& d = g_menuDisplays[idx];
+                EnterCriticalSection(&g_cs);
+                wcsncpy_s(g_shared.resDisp, d.devName, _TRUNCATE);
+                LeaveCriticalSection(&g_cs);
+                saveResDisp(d.devName);
+                log("menu: target display → %ls", d.devName);
+            }
+            return 0;
+        }
         if (id == IDM_STARTUP) {
             if (isStartupTaskEnabled())
                 deleteStartupTask();
@@ -1283,6 +2351,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             setPowerLimit(g_shared.defaultPower > 0 ? g_shared.defaultPower : 270);
             if (g_shared.cpuState == CPU_CAP_PCT)
                 applyCpuState(false);   // undo the CPU boost cap
+            restoreResolutionNow();     // undo the dropped display resolution
             Shell_NotifyIconW(NIM_DELETE, &g_nid);
             PostQuitMessage(0);
         }
@@ -1323,6 +2392,53 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     g_quitEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);   // manual-reset
     g_shared.cpuMode = loadCpuAuto() ? CPU_MODE_AUTO : CPU_MODE_OFF;
     log("CPU governor: %s", g_shared.cpuMode == CPU_MODE_AUTO ? "auto" : "off");
+    g_shared.resAuto    = loadResAuto() ? 1 : 0;
+    g_shared.resTargetW = loadResW();
+    g_shared.resTargetH = loadResH();
+    g_shared.resOnPct   = loadResOnPct();
+    // Pinned target display; empty = auto (largest current display — on
+    // this machine the real monitor, never the virtual streaming ones).
+    {
+        std::wstring disp = loadResDisp();
+        EnterCriticalSection(&g_cs);
+        wcsncpy_s(g_shared.resDisp, disp.c_str(), _TRUNCATE);
+        LeaveCriticalSection(&g_cs);
+    }
+    // Desktop (rest) resolution: learned once from the target display's
+    // Windows-default mode, then owned as a setting like everything else.
+    int defW = regReadDword(REG_KEY, L"ResDefaultW", -1);
+    int defH = regReadDword(REG_KEY, L"ResDefaultH", -1);
+    if (defW <= 0 || defH <= 0) {
+        std::vector<LiveDisplay> scratch;
+        const LiveDisplay* d = resolveDisplay(g_shared.resDisp, scratch);
+        if (d) {
+            DEVMODEW dm{};
+            dm.dmSize = sizeof(dm);
+            if (EnumDisplaySettingsW(d->devName, ENUM_REGISTRY_SETTINGS, &dm)
+                && dm.dmPelsWidth && dm.dmPelsHeight) {
+                defW = static_cast<int>(dm.dmPelsWidth);
+                defH = static_cast<int>(dm.dmPelsHeight);
+                saveResDefault(defW, defH);
+                log("res: learned desktop resolution %dx%d from %ls",
+                    defW, defH, d->devName);
+            } else {
+                log("res: could not learn the desktop resolution — pick it in"
+                    " the menu (Desktop resolution)");
+            }
+        } else {
+            log("res: target display not found at startup — desktop resolution"
+                " unset, pick it in the menu");
+        }
+    }
+    g_shared.resDefaultW = defW;
+    g_shared.resDefaultH = defH;
+    log("Resolution governor: %s (game %ux%u, desktop %ux%u, display %s,"
+        " engage %d%%)",
+        g_shared.resAuto ? "on" : "off",
+        g_shared.resTargetW, g_shared.resTargetH,
+        g_shared.resDefaultW, g_shared.resDefaultH,
+        g_shared.resDisp[0] ? "pinned" : "auto",
+        g_shared.resOnPct);
     g_worker = CreateThread(nullptr, 0, workerMain, nullptr, 0, nullptr);
 
     // --- Restore last target ---
