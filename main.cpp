@@ -1410,7 +1410,13 @@ static bool ensureDatabaseDefault(const wchar_t* dev, int w, int h,
         log("res[%ls]: cannot read the Windows default mode", dev);
         return false;
     }
-    if (reg.dmPelsWidth == (DWORD)w && reg.dmPelsHeight == (DWORD)h) {
+    DEVMODEW cur{};
+    if (!getCurrentMode(dev, &cur)) return false;
+    // Aligned means resolution AND the refresh the user actually runs — a
+    // stale 60Hz default would make monitor re-arrivals come back at 60 on
+    // a 144Hz panel (width/height alone is not enough).
+    if (reg.dmPelsWidth == (DWORD)w && reg.dmPelsHeight == (DWORD)h &&
+        reg.dmDisplayFrequency == cur.dmDisplayFrequency) {
         if (firstCheck)   // one ground-truth line per session, aligned or not
             log("res[%ls]: Windows default mode %lux%lu @%luHz — already"
                 " matches the configured desktop %dx%d",
@@ -1427,10 +1433,11 @@ static bool ensureDatabaseDefault(const wchar_t* dev, int w, int h,
                                              CDS_UPDATEREGISTRY | CDS_NORESET,
                                              nullptr);
     if (rc == DISP_CHANGE_SUCCESSFUL) {
-        log("res[%ls]: Windows default mode aligned to %dx%d @%uHz"
-            " (database had %lux%lu — stale wake default fixed)",
+        log("res[%ls]: Windows default mode aligned to %dx%d @%uHz (database"
+            " had %lux%lu @%luHz — stale wake default fixed)",
             dev, w, h, (unsigned)dm.dmDisplayFrequency,
-            (unsigned long)reg.dmPelsWidth, (unsigned long)reg.dmPelsHeight);
+            (unsigned long)reg.dmPelsWidth, (unsigned long)reg.dmPelsHeight,
+            (unsigned long)reg.dmDisplayFrequency);
         return true;
     }
     log("res[%ls]: aligning the Windows default mode failed (rc=%ld)", dev, (long)rc);
