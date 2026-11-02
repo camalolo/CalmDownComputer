@@ -193,7 +193,16 @@ changes (`badFallback`/`badDefault`); a PINNED display that vanished pauses
 the governor (logged once, `missingLogged`) — it never silently switches to
 another display. Toggling off / Exit (`restoreResolutionNow`, UI thread) /
 worker back-door shutdown all restore the configured desktop resolution and
-close the source handle (`endSourceTracking`). Menu: `IDM_RES_AUTO` + three
+close the source handle (`endSourceTracking`).
+**Wake-default alignment + drift guard (v1.6.1)**: display sleep/wake
+re-arrives the monitor and Windows re-applies its DATABASE default mode —
+a stale one (an old manual 1440p setting) made every wake come back at 2K
+with resized windows. `ensureDatabaseDefault` aligns that saved default to
+the configured desktop resolution via `CDS_UPDATEREGISTRY|CDS_NORESET`
+(save-without-apply; throttled 5 min, only when not engaged, only exact
+native modes). While ENGAGED, a drift guard re-checks the target display's
+current mode every `RES_ON_MS` and re-applies the game resolution (CCD,
+instant) if a wake reset it mid-game. Menu: `IDM_RES_AUTO` + three
 submenus (game res, desktop res, target display from the live
 `g_menuDisplays` snapshot; `IDM_RES_DISP_BASE`+i dispatch indexes that same
 snapshot). Worker reconciles against `g_shared.resAuto/resTargetW/resTargetH/

@@ -1396,6 +1396,47 @@ static bool restoreToDefault(const LiveDisplay* disp) {
     return restoreDisplayMode(disp->devName);
 }
 
+// Make the OS display database default for this display match the
+// configured desktop resolution WITHOUT touching the current mode
+// (CDS_UPDATEREGISTRY | CDS_NORESET — the documented save-without-apply).
+// Why: display sleep/wake and monitor re-arrival restore the DATABASE
+// default, so a stale one (an old manual 1440p setting, here) makes every
+// wake come back at the wrong resolution with resized maximized windows.
+static bool ensureDatabaseDefault(const wchar_t* dev, int w, int h,
+                                  bool firstCheck) {
+    DEVMODEW reg{};
+    reg.dmSize = sizeof(reg);
+    if (!EnumDisplaySettingsExW(dev, ENUM_REGISTRY_SETTINGS, &reg, 0)) {
+        log("res[%ls]: cannot read the Windows default mode", dev);
+        return false;
+    }
+    if (reg.dmPelsWidth == (DWORD)w && reg.dmPelsHeight == (DWORD)h) {
+        if (firstCheck)   // one ground-truth line per session, aligned or not
+            log("res[%ls]: Windows default mode %lux%lu @%luHz — already"
+                " matches the configured desktop %dx%d",
+                dev, (unsigned long)reg.dmPelsWidth,
+                (unsigned long)reg.dmPelsHeight,
+                (unsigned long)reg.dmDisplayFrequency, w, h);
+        return true;   // already aligned — nothing to write
+    }
+    DEVMODEW dm{};
+    if (!findNativeMode(dev, w, h, &dm))
+        return false;   // only ever persist an exact native mode
+    dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+    const LONG rc = ChangeDisplaySettingsExW(dev, &dm, nullptr,
+                                             CDS_UPDATEREGISTRY | CDS_NORESET,
+                                             nullptr);
+    if (rc == DISP_CHANGE_SUCCESSFUL) {
+        log("res[%ls]: Windows default mode aligned to %dx%d @%uHz"
+            " (database had %lux%lu — stale wake default fixed)",
+            dev, w, h, (unsigned)dm.dmDisplayFrequency,
+            (unsigned long)reg.dmPelsWidth, (unsigned long)reg.dmPelsHeight);
+        return true;
+    }
+    log("res[%ls]: aligning the Windows default mode failed (rc=%ld)", dev, (long)rc);
+    return false;
+}
+
 // Governor state — worker thread only.
 struct ResGov {
     int       want     = -1;   // last seen UI flag (-1 = not seen yet)
@@ -1410,6 +1451,11 @@ struct ResGov {
     bool      deathLogged   = false;// source-exited logged once (restore may retry)
     ULONGLONG hotSince = 0;   // sustained heavy load → drop attempt
     ULONGLONG normSince  = 0; // sustained all-quiet while quiet → enforce desktop res
+    // Database-default alignment (wake fix) + engaged drift guard state.
+    ULONGLONG dbSync      = 0;   // last database-default check
+    int       dbW = 0, dbH = 0;  // desktop res as of the last check
+    ULONGLONG lastDriftFix = 0;  // last mid-game drift re-apply attempt
+    bool      driftLogged  = false;
     // Source tracking: the app we dropped FOR. Its lifetime is the ONLY
     // release trigger. The HANDLE (not the pid) survives pid reuse.
     HANDLE    srcProcess = nullptr;
@@ -1509,7 +1555,38 @@ static void resTick(int util, int fg) {
         // else flips the resolution back (that was the flip-flop bug).
         const bool sourceAlive = g_res.srcProcess &&
             WaitForSingleObject(g_res.srcProcess, 0) != WAIT_OBJECT_0;
-        if (sourceAlive) return;   // stay dropped — ignore util/fg/CPU entirely
+        if (sourceAlive) {
+            // Drift guard: a display sleep/wake (or monitor re-arrival)
+            // re-applies the OS database default and can reset the runtime
+            // mid-game. Engaged means the display IS at game res — enforce.
+            if (tw > 0 && !g_res.badFallback &&
+                now - g_res.lastDriftFix >= RES_ON_MS) {
+                std::vector<LiveDisplay> scratch;
+                const LiveDisplay* disp = resolveDisplay(g_shared.resDisp, scratch);
+                if (disp) {
+                    DEVMODEW cur{};
+                    if (getCurrentMode(disp->devName, &cur) &&
+                        ((int)cur.dmPelsWidth != tw || (int)cur.dmPelsHeight != th)) {
+                        g_res.lastDriftFix = now;
+                        if (applyDisplayMode(disp->devName, tw, th)
+                            == DISP_CHANGE_SUCCESSFUL) {
+                            if (!g_res.driftLogged) {
+                                g_res.driftLogged = true;
+                                log("res[%ls]: mode drifted to %lux%lu"
+                                    " (display wake?) → game resolution"
+                                    " re-applied %dx%d",
+                                    disp->devName,
+                                    (unsigned long)cur.dmPelsWidth,
+                                    (unsigned long)cur.dmPelsHeight, tw, th);
+                            }
+                        }
+                    } else {
+                        g_res.driftLogged = false;   // clean again
+                    }
+                }
+            }
+            return;   // stay dropped — ignore util/fg/CPU entirely
+        }
 
         std::vector<LiveDisplay> scratch;
         const LiveDisplay* disp = resolveDisplay(g_shared.resDisp, scratch);
@@ -1535,6 +1612,20 @@ static void resTick(int util, int fg) {
             g_res.normSince = 0;
         }   // else: retry next tick (engaged stays true)
         return;
+    }
+
+    // Keep the OS display database aligned with the configured desktop
+    // resolution (feature owns the display while on): sleep/wake and monitor
+    // re-arrival restore the DATABASE default, so a stale one makes every
+    // wake come back at the wrong resolution. Throttled; silent when aligned.
+    if (want && dw > 0 && dh > 0 &&
+        (dw != g_res.dbW || dh != g_res.dbH ||
+         now - g_res.dbSync >= 300000)) {
+        const bool firstCheck = (g_res.dbW == 0 && g_res.dbH == 0);
+        g_res.dbW = dw; g_res.dbH = dh; g_res.dbSync = now;
+        std::vector<LiveDisplay> scratch;
+        const LiveDisplay* disp = resolveDisplay(g_shared.resDisp, scratch);
+        if (disp) ensureDatabaseDefault(disp->devName, dw, dh, firstCheck);
     }
 
     // Quiet state: two independent watches — sourced-heavy→drop,
