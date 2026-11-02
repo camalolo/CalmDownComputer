@@ -1402,8 +1402,14 @@ static bool restoreToDefault(const LiveDisplay* disp) {
 // Why: display sleep/wake and monitor re-arrival restore the DATABASE
 // default, so a stale one (an old manual 1440p setting, here) makes every
 // wake come back at the wrong resolution with resized maximized windows.
-static bool ensureDatabaseDefault(const wchar_t* dev, int w, int h,
-                                  bool firstCheck) {
+// Make the OS display database default for this display match the mode it
+// is CURRENTLY running (feature on, not engaged, quiet): display sleep/wake
+// and monitor re-arrival restore the DATABASE default, so whatever the user
+// leaves the display at becomes its wake mode. Deliberately aligned to the
+// CURRENT mode — never to a configured value — so the app cannot fight the
+// user's choice for a given panel (e.g. a TV they deliberately run at
+// 1080p). Only exact native modes are persisted.
+static bool ensureDatabaseDefault(const wchar_t* dev, bool firstCheck) {
     DEVMODEW reg{};
     reg.dmSize = sizeof(reg);
     if (!EnumDisplaySettingsExW(dev, ENUM_REGISTRY_SETTINGS, &reg, 0)) {
@@ -1412,30 +1418,29 @@ static bool ensureDatabaseDefault(const wchar_t* dev, int w, int h,
     }
     DEVMODEW cur{};
     if (!getCurrentMode(dev, &cur)) return false;
-    // Aligned means resolution AND the refresh the user actually runs — a
-    // stale 60Hz default would make monitor re-arrivals come back at 60 on
-    // a 144Hz panel (width/height alone is not enough).
-    if (reg.dmPelsWidth == (DWORD)w && reg.dmPelsHeight == (DWORD)h &&
+    if (reg.dmPelsWidth == cur.dmPelsWidth &&
+        reg.dmPelsHeight == cur.dmPelsHeight &&
         reg.dmDisplayFrequency == cur.dmDisplayFrequency) {
-        if (firstCheck)   // one ground-truth line per session, aligned or not
-            log("res[%ls]: Windows default mode %lux%lu @%luHz — already"
-                " matches the configured desktop %dx%d",
+        if (firstCheck)   // one ground-truth line per session
+            log("res[%ls]: Windows default mode %lux%lu @%luHz — matches"
+                " the current mode",
                 dev, (unsigned long)reg.dmPelsWidth,
                 (unsigned long)reg.dmPelsHeight,
-                (unsigned long)reg.dmDisplayFrequency, w, h);
+                (unsigned long)reg.dmDisplayFrequency);
         return true;   // already aligned — nothing to write
     }
     DEVMODEW dm{};
-    if (!findNativeMode(dev, w, h, &dm))
-        return false;   // only ever persist an exact native mode
+    if (!findNativeMode(dev, (int)cur.dmPelsWidth, (int)cur.dmPelsHeight, &dm))
+        return false;
     dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
     const LONG rc = ChangeDisplaySettingsExW(dev, &dm, nullptr,
                                              CDS_UPDATEREGISTRY | CDS_NORESET,
                                              nullptr);
     if (rc == DISP_CHANGE_SUCCESSFUL) {
-        log("res[%ls]: Windows default mode aligned to %dx%d @%uHz (database"
-            " had %lux%lu @%luHz — stale wake default fixed)",
-            dev, w, h, (unsigned)dm.dmDisplayFrequency,
+        log("res[%ls]: Windows default mode aligned to the current mode"
+            " %lux%lu @%luHz (database had %lux%lu @%luHz)",
+            dev, (unsigned long)cur.dmPelsWidth, (unsigned long)cur.dmPelsHeight,
+            (unsigned long)cur.dmDisplayFrequency,
             (unsigned long)reg.dmPelsWidth, (unsigned long)reg.dmPelsHeight,
             (unsigned long)reg.dmDisplayFrequency);
         return true;
@@ -1460,7 +1465,6 @@ struct ResGov {
     ULONGLONG normSince  = 0; // sustained all-quiet while quiet → enforce desktop res
     // Database-default alignment (wake fix) + engaged drift guard state.
     ULONGLONG dbSync      = 0;   // last database-default check
-    int       dbW = 0, dbH = 0;  // desktop res as of the last check
     ULONGLONG lastDriftFix = 0;  // last mid-game drift re-apply attempt
     bool      driftLogged  = false;
     // Source tracking: the app we dropped FOR. Its lifetime is the ONLY
@@ -1621,18 +1625,16 @@ static void resTick(int util, int fg) {
         return;
     }
 
-    // Keep the OS display database aligned with the configured desktop
-    // resolution (feature owns the display while on): sleep/wake and monitor
-    // re-arrival restore the DATABASE default, so a stale one makes every
-    // wake come back at the wrong resolution. Throttled; silent when aligned.
-    if (want && dw > 0 && dh > 0 &&
-        (dw != g_res.dbW || dh != g_res.dbH ||
-         now - g_res.dbSync >= 300000)) {
-        const bool firstCheck = (g_res.dbW == 0 && g_res.dbH == 0);
-        g_res.dbW = dw; g_res.dbH = dh; g_res.dbSync = now;
+    // Keep the OS display database aligned with whatever the pinned display
+    // is actually running (feature owns the display while on): sleep/wake
+    // and monitor re-arrival restore the DATABASE default, so a stale one
+    // makes every wake come back wrong. Throttled; silent when aligned.
+    if (want && now - g_res.dbSync >= 300000) {
+        const bool firstCheck = (g_res.dbSync == 0);
+        g_res.dbSync = now;
         std::vector<LiveDisplay> scratch;
         const LiveDisplay* disp = resolveDisplay(g_shared.resDisp, scratch);
-        if (disp) ensureDatabaseDefault(disp->devName, dw, dh, firstCheck);
+        if (disp) ensureDatabaseDefault(disp->devName, firstCheck);
     }
 
     // Quiet state: two independent watches — sourced-heavy→drop,
