@@ -8,7 +8,8 @@ CalmDownComputer (renamed from CalmDownGPU in v1.3.0; old names may linger in
 the deployed machine: legacy exe/task/registry are migrated, see Deployment)
 is a tiny Windows system-tray app (single static-CRT exe) that keeps the
 machine cool. GPU: regulates NVIDIA temperature by **capping core clocks**
-(`nvidia-smi -lgc`). CPU: caps the AC "Maximum processor state" at 95% when
+(NVML `nvmlDeviceSetGpuLockedClocks`, the API behind `nvidia-smi -lgc`).
+CPU: caps the AC "Maximum processor state" at 95% when
 idle (disables Ryzen Core Performance Boost) and restores 100% on sustained
 load. Display (opt-in, v1.4.0+): this box has VIRTUAL displays (streaming
 driver; the GDI "primary" is one of them), so the governor targets a
@@ -95,20 +96,40 @@ old time-only format made session boundaries ambiguous).
 
 Control flow: `wWinMain` → hidden tool window + tray → `SetTimer` 10s →
 `onTimerTick()` (UI): snapshot `g_shared` → apply confirmed `capDone` →
-`requestTrayRefresh` → `regulateTick()`. The worker loop (~1/s): `queryTempUtil`
-(temp + utilisation in ONE nvidia-smi call — don't split them back into two
-subprocesses, the churn feeds load sampling) → apply pending cap
-(`-lgc`/`-rgc`) → `cpuTick()` (CPU governor) → `resTick()` (resolution
-governor) → publish temp/util → tray refresh. `queryCpuUsagePct` /
-`queryForegroundPct` are sampled ONCE per iteration in the worker loop and
-passed into `cpuTick`/`resTick` — both keep delta state, a second call per
-iteration would corrupt it. While the CPU governor is engaged, the tray blink
-alternates GPU temp ↔ CPU state icons on fixed wall-clock phases
-(`TRAY_BLINK_MS` 10s), posting only on phase changes — a state change shows
-its colour immediately. CPU phases paint the frozen CPU load %.
-UI→worker commands: `enqueueCap()`; worker→UI results: `capDone`
+`requestTrayRefresh` → `regulateTick()`. The worker loop (EXACTLY 1 Hz —
+`WORKER_TICK_MS`, paced by a `WaitForSingleObject` on the quit event, not
+`Sleep(200)`, which with µs-fast NVML ticks would have spun at ~5/s):
+`queryTempUtil` (temp + utilisation; NVML in-process first at ~0.1µs, ONE
+nvidia-smi call as fallback — never split them back into two subprocesses,
+the churn feeds load sampling) → apply pending cap (`nvmlDeviceSetGpuLocked
+Clocks` / `nvmlDeviceResetGpuLockedClocks`, i.e. `-lgc`/`-rgc` without the
+spawn; subprocess fallback) → `cpuTick()` (CPU governor) → `resTick()`
+(resolution governor) → publish temp/util → tray refresh.
+`queryCpuUsagePct` / `queryForegroundPct` are sampled ONCE per iteration in
+the worker loop and passed into `cpuTick`/`resTick` — both keep delta state,
+a second call per iteration would corrupt it. While the CPU governor is
+engaged, the tray blink alternates GPU temp ↔ CPU state icons on fixed
+wall-clock phases (`TRAY_BLINK_MS` 10s), posting only on phase changes — a
+state change shows its colour immediately. CPU phases paint the frozen CPU
+load %. UI→worker commands: `enqueueCap()`; worker→UI results: `capDone`
 (-1 restored, >0 applied MHz, <0 failed). `capMhz` in the Controller is
 updated only from confirmed results.
+
+**NVML layer (v1.7.0, the nimble fix):** the hot loop reads temp/util and
+applies clock caps through NVML — the driver-shipped `nvml.dll` (System32)
+that nvidia-smi itself wraps — loaded dynamically in `main.cpp` (minimal
+stable-C-ABI declarations, 7 function pointers; no SDK header). Measured on
+this machine: an nvidia-smi spawn costs ~6ms of CPU charged to THIS process
+per call (CreateProcess + image load + NVML re-init in the child) and the
+old loop ran 2-4 spawns/s → the constant ~2%-of-a-core burn (2,373 CPU-s).
+In-process NVML: ~0.1µs per temp+util pair. `nvmlEnsure()` gates every call;
+load failures back off 60s (driver service may be starting at logon), a
+mid-call failure (`nvmlFail`) drops to the subprocess path and retries NVML
+after 5s (driver reload/hibernate self-heal). Failure logs are throttled to
+one line per 10min. Startup discovery (name, maxClock, power limit) and
+powercfg/schtasks stay on `runHidden` deliberately (3 spawns/session, exact
+`clocks.max.sm` semantics). Log lines carry an "(nvml)" tag when the direct
+path fired.
 
 **CPU boost governor (`cpuTick`)**, ~1/s on the worker thread. Two sensors:
 total CPU load via `GetSystemTimes`, and the FOREGROUND process's CPU time
@@ -243,7 +264,7 @@ Key plumbing:
 - Tuning constants are `#define`s at the top of `main.cpp` (~line 100):
   `HISTORY_LEN`, `DEADBAND_C`, `CLOCK_KP`, `CLOCK_STEP_MIN/MAX`,
   `CLOCK_KP_UP`, `CLOCK_STEP_UP_MAX`, `CLOCK_COOL_TICKS`, `CLOCK_MIN`,
-  `CLOCK_LOW`, the CPU governor block `CPU_CAP_PCT`,
+  `CLOCK_LOW`, `WORKER_TICK_MS`, the CPU governor block `CPU_CAP_PCT`,
   `CPU_USAGE_ON_PCT/OFF_PCT`, `CPU_ON_MS/OFF_MS`, and the resolution
   governor block `RES_ON_PCT/OFF_PCT`, `RES_ON_MS/OFF_MS`.
 - Menu presets are table-driven: `g_presets` (temp targets), `g_resPresets`
@@ -259,7 +280,8 @@ Key plumbing:
 
 ## Gotchas
 
-- **GPU index 0 hardcoded** (`-i 0`) in every nvidia-smi command.
+- **GPU index 0 hardcoded** (`-i 0` in every nvidia-smi command; NVML device
+  handle for index 0).
 - **The power domain lies on this system** (driver 595.97, RTX 3070):
   power range reads N/A under load; `power.limit` readback ignores applied
   limits (returns the default). Never reintroduce power-limit regulation —
@@ -282,8 +304,9 @@ Key plumbing:
 - **powercfg `/query` output leads with "Possible Settings" bounds**
   (`0x00000000`/`0x64`/`1`) BEFORE the index lines — parse the LAST two `0x`
   tokens (AC, then DC; DC prints even on desktops), never the first.
-  Subprocess churn from powercfg/nvidia-smi also feeds GetSystemTimes load
-  sampling (~+5%) — keep idle thresholds above the loop's own noise floor.
+  Subprocess churn (powercfg/nvidia-smi) also feeds GetSystemTimes load
+  sampling (~+5%) — keep idle thresholds above the noise floor; the NVML
+  path produces no churn at all, so this mostly matters in fallback mode.
 - **CPU governor signal choice matters**: total load idles at 13-20% on this
   machine (desktop background + agent harness), so idle detection uses the
   FOREGROUND process (games pin ≥25% of a core, office ≤10%) with total load
@@ -295,9 +318,12 @@ Key plumbing:
 - The context menu is rebuilt on every open, which synchronously runs
   `schtasks /query` on the UI thread (bounded by runHidden's watchdog;
   acceptable).
-- `nvidia-smi` must be on PATH; missing GPU reads are non-fatal (temp −1 →
-  grey `--` icon, regulation pauses). If `clocks.max.sm` is unavailable,
-  clock control is disabled entirely (the app has no other lever).
+- `nvidia-smi` must be on PATH for the fallback path + startup discovery;
+  the NVML hot path needs `nvml.dll` (System32 on driver installs, with a
+  legacy NVSMI path fallback). Both missing: reads fail non-fatally
+  (temp −1 → grey `--` icon, regulation pauses). If `clocks.max.sm` is
+  unavailable, clock control is disabled entirely (the app has no other
+  lever).
 - **No ACPI thermal zones on this board** (`MSAcpi_ThermalZoneTemperature`
   returns an empty list): real CPU temp is unreachable without a kernel
   driver (Ryzen SMN needs ring0). The CPU blink phases show CPU load % —

@@ -3,7 +3,7 @@
 A tiny Windows system-tray app that keeps your machine cool. It regulates the
 NVIDIA GPU by capping core clocks, and tames the CPU by switching Ryzen's
 Core Performance Boost off when the machine is idle. No bloated overlays, no
-background services — just a single ~240 KB static `.exe` in the tray.
+background services — just a single ~330 KB static `.exe` in the tray.
 
 ![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)
 ![license](https://img.shields.io/badge/license-MIT-green)
@@ -18,7 +18,8 @@ background services — just a single ~240 KB static `.exe` in the tray.
   to user mode, so load is shown instead.) Icons are pre-rendered and posted
   only on phase changes — effectively zero cost.
 - **GPU clock regulation** — click the tray to pick a target (Off, 60–90 °C,
-  ∞). The app steers the GPU core-clock cap (`nvidia-smi -lgc`) proportionally:
+  ∞). The app steers the GPU core-clock cap (`nvmlDeviceSetGpuLockedClocks`,
+  the `-lgc` API) proportionally:
   fast dive when hot, reluctant climb when cool, ±1.5 °C deadband, and it
   learns the card's voltage cliff (the clock above which temperature explodes)
   and parks just below it.
@@ -50,9 +51,11 @@ background services — just a single ~240 KB static `.exe` in the tray.
 ## How it works
 
 ```
-nvidia-smi --query-gpu=temperature.gpu   →  read GPU temp
-nvidia-smi -lgc 210,<cap>                →  cap GPU core clocks
-nvidia-smi -rgc                          →  restore default clocks
+NVML (driver nvml.dll, in-process, ~0.1µs):
+  nvmlDeviceGetTemperature / GetUtilizationRates → read GPU temp + load
+  nvmlDeviceSetGpuLockedClocks(210,<cap>)        → cap GPU core clocks
+  nvmlDeviceResetGpuLockedClocks                 → restore default clocks
+  (missing nvml.dll → the nvidia-smi subprocess path does all of the above)
 
 GetSystemTimes()                          →  total CPU load (1 s samples)
 powercfg /setacvalueindex … PROCTHROTTLEMAX 95
@@ -60,15 +63,19 @@ powercfg /setactive SCHEME_CURRENT        →  CPU boost cap on/off
 powercfg /query … PROCTHROTTLEMAX         →  verify the write
 ```
 
-GPU regulation runs on 10-second ticks (weighted average, proportional steps,
-settle windows). The CPU governor samples once a second on the worker thread.
-All external commands and tray painting run on a worker thread, so a hung
-driver call can never freeze the app (a 15-second watchdog kills stalled
-subprocesses).
+GPU sensing and clock caps go through NVML — the driver-shipped library
+`nvidia-smi` itself wraps — costing ~0.1µs per reading instead of a ~6ms
+process spawn per call. The result is an idle footprint in the hundredths of
+a percent of one core instead of a constant ~2%. GPU regulation runs on
+10-second ticks (weighted average, proportional steps, settle windows). The
+CPU governor samples once a second on the worker thread. All external
+commands and tray painting run on a worker thread, so a hung driver call can
+never freeze the app (a 15-second watchdog kills stalled subprocesses).
 
 ## Requirements
 
-- **NVIDIA GPU** with `nvidia-smi` on the PATH (installed with NVIDIA drivers)
+- **NVIDIA GPU** with the standard driver install (provides `nvml.dll` in
+  System32; `nvidia-smi` on PATH as fallback)
 - **Windows 10 or 11**
 - The app runs **as administrator** (required for clock locking). A UAC prompt
   appears on launch.

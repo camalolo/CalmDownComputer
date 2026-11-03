@@ -24,6 +24,14 @@
 //   worker thread, so a stalled call can never freeze the app.
 // - Hidden commands: CreateProcess with CREATE_NO_WINDOW; runHidden is
 //   bounded (non-blocking drain + 15s watchdog kill).
+// - In-process GPU access: sensing (temp/util) and the clock-cap actuator
+//   go through NVML — the driver-shipped nvml.dll that nvidia-smi itself
+//   wraps — loaded dynamically, at ~0.1µs per reading. Spawning nvidia-smi
+//   per tick was measured at ~6ms of CPU charged to this process per call
+//   (CreateProcess + image load + full NVML re-init in the child) at 2-4
+//   ticks/s: the entire historical background burn. The subprocess path
+//   remains as the automatic fallback (and does the 3 one-time startup
+//   discoveries), so a missing nvml.dll degrades to the old behavior.
 // - Control: 10s ticks, weighted average, ±1.5°C deadband.
 //   • Above target: proportional dive — 10MHz per °C over, 15–150MHz steps
 //   • Below target: climb 15–30MHz after ~40s of sustained cool
@@ -131,6 +139,7 @@ static void logOpen() {
 #define TIMER_MS         10000       // 10 seconds
 #define TRAY_BLINK_MS    10000       // CPU-state blink phase (~1 flip per 10s)
 #define TRAY_ENSURE_MS   60000       // periodic tray-icon presence check
+#define WORKER_TICK_MS   1000        // worker loop period — exact pacing (1 Hz)
 #define HISTORY_LEN      6           // rolling window: 6 × 10s = 60s
 #define DEADBAND_C       1.5         // ±1.5°C: don't adjust within this band
 
@@ -342,6 +351,135 @@ static std::string trim(const std::string& s) {
     return s.substr(a, b - a + 1);
 }
 
+// ───────────────────── NVML — in-process GPU access ─────────────────────
+// nvidia-smi is a command-line wrapper around NVML, the driver-shipped
+// library (C:\Windows\System32\nvml.dll on every modern install). A spawn
+// cost ~6ms of CPU charged to THIS process (CreateProcess + image load +
+// a full NVML re-init inside the child each call), and the old worker loop
+// ran 2-4 spawns per second — a constant ~2%-of-a-core burn, plus Defender
+// scanning every spawn and ~+5% of subprocess churn polluting the CPU
+// governor's own load sampling. The same readings and the same -lgc/-rgc
+// actuator cost ~0.1 MICROseconds in-process (measured on this machine).
+// The library is loaded dynamically: missing or failing → every wrapper
+// below falls back to the original nvidia-smi subprocess path (pre-1.7
+// behavior). Minimal stable-C-ABI surface only; the enum values mirror the
+// documented nvml.h (NVML_SUCCESS = 0, NVML_TEMPERATURE_GPU = 0). The
+// locked-clocks pair exists since driver 415 — nvidia-smi's -lgc/-rgc are
+// its CLI spelling.
+
+struct nvmlUtilization_t { unsigned int gpu; unsigned int memory; };
+typedef struct nvmlDevice_st* nvmlDevice_t;
+
+static nvmlDevice_t     g_nvmlDev      = nullptr;  // set by nvmlSetup()
+static volatile LONG    g_nvmlReady    = 0;        // 1 = in-process access active
+static ULONGLONG        g_nvmlReinitAt = 0;        // earliest next (re)init attempt
+static ULONGLONG        g_nvmlErrLogMs = 0;        // failure-log throttle
+
+static int (*p_nvmlInit)(void);
+static int (*p_nvmlShutdown)(void);
+static int (*p_nvmlGetHandle)(unsigned, nvmlDevice_t*);
+static int (*p_nvmlGetTemp)(nvmlDevice_t, int /*NVML_TEMPERATURE_GPU*/, unsigned*);
+static int (*p_nvmlGetUtil)(nvmlDevice_t, nvmlUtilization_t*);
+static int (*p_nvmlLockClocks)(nvmlDevice_t, unsigned /*min*/, unsigned /*max*/);
+static int (*p_nvmlUnlockClocks)(nvmlDevice_t);
+
+// One line per failure kind of moment, then quiet for 10 minutes — a dead
+// NVML must not spam the log at tick rate.
+static void nvmlErr(const char* what, int rc) {
+    const ULONGLONG now = GetTickCount64();
+    if (g_nvmlErrLogMs && now - g_nvmlErrLogMs < 600000) return;
+    g_nvmlErrLogMs = now;
+    log("nvml: %s failed (rc=%d) — falling back to nvidia-smi", what, rc);
+}
+
+// A call that FAILED while active: stop using NVML, self-heal quickly
+// (covers driver reload / resume from hibernate).
+static void nvmlFail(const char* what, int rc) {
+    nvmlErr(what, rc);
+    InterlockedExchange(&g_nvmlReady, 0);
+    g_nvmlDev = nullptr;
+    g_nvmlReinitAt = GetTickCount64() + 5000;
+}
+
+// Load + init + device handle. Safe to call again after a failure —
+// LoadLibrary/GetProcAddress are OS-cached, the whole call is microseconds.
+static bool nvmlSetup() {
+    InterlockedExchange(&g_nvmlReady, 0);
+    g_nvmlDev = nullptr;
+    HMODULE h = LoadLibraryW(L"nvml.dll");            // System32 on driver installs
+    if (!h) h = LoadLibraryW(L"C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvml.dll");
+    if (!h) { nvmlErr("nvml.dll not found", -1); return false; }
+    if (!p_nvmlInit) {
+        struct Sym { const char* name; void** pfn; };
+        const Sym syms[] = {
+            { "nvmlInit_v2",                    (void**)&p_nvmlInit },
+            { "nvmlShutdown",                   (void**)&p_nvmlShutdown },
+            { "nvmlDeviceGetHandleByIndex_v2",  (void**)&p_nvmlGetHandle },
+            { "nvmlDeviceGetTemperature",       (void**)&p_nvmlGetTemp },
+            { "nvmlDeviceGetUtilizationRates",  (void**)&p_nvmlGetUtil },
+            { "nvmlDeviceSetGpuLockedClocks",   (void**)&p_nvmlLockClocks },
+            { "nvmlDeviceResetGpuLockedClocks", (void**)&p_nvmlUnlockClocks },
+        };
+        for (const Sym& s : syms) {
+            *s.pfn = (void*)GetProcAddress(h, s.name);
+            if (!*s.pfn) { nvmlErr(s.name, -2); return false; }
+        }
+    }
+    int rc = p_nvmlInit();
+    if (rc != 0) { nvmlErr("nvmlInit", rc); return false; }
+    rc = p_nvmlGetHandle(0, &g_nvmlDev);
+    if (rc != 0 || !g_nvmlDev) {
+        nvmlErr("nvmlDeviceGetHandleByIndex(0)", rc);
+        g_nvmlDev = nullptr;
+        return false;
+    }
+    InterlockedExchange(&g_nvmlReady, 1);
+    return true;
+}
+
+// Gate for every NVML call: already active, or a (re)setup is due. Load
+// failures back off 60s (the driver service may still be starting at
+// logon); a mid-call failure retries after 5s (nvmlFail).
+static bool nvmlEnsure() {
+    if (g_nvmlReady) return true;
+    const ULONGLONG now = GetTickCount64();
+    if (now < g_nvmlReinitAt) return false;
+    g_nvmlReinitAt = now + 60000;
+    return nvmlSetup();
+}
+
+static bool nvmlQueryTempUtil(int* tempOut, int* utilOut) {
+    unsigned t = 0;
+    nvmlUtilization_t u{};
+    int rc = p_nvmlGetTemp(g_nvmlDev, 0, &t);
+    if (rc != 0) { nvmlFail("nvmlDeviceGetTemperature", rc); return false; }
+    rc = p_nvmlGetUtil(g_nvmlDev, &u);
+    if (rc != 0) { nvmlFail("nvmlDeviceGetUtilizationRates", rc); return false; }
+    *tempOut = static_cast<int>(t);
+    if (utilOut) *utilOut = static_cast<int>(u.gpu);
+    return true;
+}
+
+static bool nvmlSetClockCap(int capMhz) {
+    int rc = p_nvmlLockClocks(g_nvmlDev, CLOCK_LOW, static_cast<unsigned>(capMhz));
+    if (rc != 0) { nvmlFail("nvmlDeviceSetGpuLockedClocks", rc); return false; }
+    return true;
+}
+
+static bool nvmlResetClocks() {
+    int rc = p_nvmlUnlockClocks(g_nvmlDev);
+    if (rc != 0) { nvmlFail("nvmlDeviceResetGpuLockedClocks", rc); return false; }
+    return true;
+}
+
+// Pair the init at exit (the worker is gone by then). Process teardown
+// would clean up anyway — this is hygiene.
+static void nvmlTeardown() {
+    if (g_nvmlReady) p_nvmlShutdown();
+    InterlockedExchange(&g_nvmlReady, 0);
+}
+
+
 // ───────────────────────── nvidia-smi wrappers ─────────────────────────
 
 // Returns °C (or -1 on failure) and, via utilOut, GPU utilisation % (-1 when
@@ -351,6 +489,12 @@ static std::string trim(const std::string& s) {
 // load, clocks.sm and utilisation both stay honest even with caps applied.
 static int queryTempUtil(int* utilOut) {
     if (utilOut) *utilOut = -1;
+    // In-process NVML first (~0.1µs). On any NVML problem, fall through to
+    // the subprocess path — identical readings, pre-1.7 behavior.
+    if (nvmlEnsure()) {
+        int temp = -1;
+        if (nvmlQueryTempUtil(&temp, utilOut)) return temp;
+    }
     auto r = runHidden("nvidia-smi --query-gpu=temperature.gpu,utilization.gpu"
                        " --format=csv,noheader,nounits -i 0");
     auto s = trim(r.output);
@@ -407,6 +551,12 @@ static int queryMaxClock() {
 
 // Cap core clocks to [CLOCK_LOW, capMhz]. Returns true on success.
 static bool setClockCap(int capMhz) {
+    // NVML first — the direct driver call is MORE trustworthy than a CLI
+    // exit code (it IS what -lgc does underneath).
+    if (nvmlEnsure() && nvmlSetClockCap(capMhz)) {
+        log("setClockCap: %dMHz OK (nvml)", capMhz);
+        return true;
+    }
     std::string cmd = "nvidia-smi -lgc " + std::to_string(CLOCK_LOW) + "," +
                       std::to_string(capMhz) + " -i 0";
     auto r = runHidden(cmd.c_str());
@@ -419,6 +569,10 @@ static bool setClockCap(int capMhz) {
 
 // Restore default clocks. Returns true on success.
 static bool resetClocks() {
+    if (nvmlEnsure() && nvmlResetClocks()) {
+        log("resetClocks: OK (nvml)");
+        return true;
+    }
     auto r = runHidden("nvidia-smi -rgc -i 0");
     bool ok = (r.exitCode == 0);
     if (ok) log("resetClocks: OK");
@@ -2139,6 +2293,13 @@ static void regulateTick() {
 // Owns every blocking external call: nvidia-smi queries/commands and tray
 // painting. The UI thread never blocks on the outside world.
 static DWORD WINAPI workerMain(LPVOID) {
+    // In-process NVML first — it makes every tick below ~free. Startup
+    // discovery deliberately stays on the subprocess path (three spawns per
+    // session) so queryMaxClock keeps its exact clocks.max.sm semantics.
+    log("NVML: %s", nvmlEnsure()
+        ? "direct in-process access active (nvidia-smi subprocess fallback retained)"
+        : "unavailable — readings and commands use the nvidia-smi subprocess");
+
     // --- Startup discovery ---
     std::string name = queryGpuName();
     int mclk = queryMaxClock();
@@ -2182,6 +2343,7 @@ static DWORD WINAPI workerMain(LPVOID) {
     int       paintUsage   = -1;
     ULONGLONG lastTrayEnsure = GetTickCount64();   // periodic tray self-heal
     while (WaitForSingleObject(g_quitEvent, 0) != WAIT_OBJECT_0) {
+        const ULONGLONG tickStart = GetTickCount64();   // pacing anchor
         int util = -1;
         int temp = queryTempUtil(&util);
 
@@ -2285,7 +2447,17 @@ static DWORD WINAPI workerMain(LPVOID) {
             lastTrayEnsure = nowMs;
             trayRefresh();
         }
-        Sleep(200);   // light pacing; the queries above take ~0.5-1s themselves
+        // Exact 1 Hz pacing. The old loop slept a fixed 200ms and relied on
+        // the nvidia-smi subprocess burning 0.5-1s of wall time per tick;
+        // with NVML a tick takes microseconds, so that pacing would have
+        // spun at ~5 ticks/s for nothing. A fixed 1s period keeps every
+        // governor's wall-clock windows (10s/30s/45s) sampling at the
+        // cadence their constants assume. Waiting on the quit event (not
+        // Sleep) keeps Exit responsive.
+        const ULONGLONG elapsed = GetTickCount64() - tickStart;
+        const DWORD wait = (elapsed < WORKER_TICK_MS)
+            ? static_cast<DWORD>(WORKER_TICK_MS - elapsed) : 0;
+        WaitForSingleObject(g_quitEvent, wait);
     }
     // Back-door shutdown (not the Exit menu item — that restores on the UI
     // thread): never leave the display dropped.
@@ -2602,6 +2774,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     // Shutdown: stop the worker, then leave.
     SetEvent(g_quitEvent);
     if (g_worker) { WaitForSingleObject(g_worker, 3000); CloseHandle(g_worker); }
+    nvmlTeardown();
     CloseHandle(g_quitEvent);
     DeleteCriticalSection(&g_cs);
     if (hMutex) CloseHandle(hMutex);
