@@ -1170,12 +1170,25 @@ static HMONITOR monitorForDevice(const wchar_t* devName) {
     return ctx.hmon;
 }
 
-struct WinCtx { DWORD pid; HMONITOR hmon; HWND found; };
+struct WinCtx {
+    DWORD pid;
+    HMONITOR hmon;
+    HWND fgRootOwner;   // the window the user is actually looking at
+    HWND fgRoot;
+    HWND found;
+    wchar_t cls[64];    // qualifying window's class (engage-log diagnostics)
+    RECT rect;
+};
 
-// Accepts a top-level, visible, non-minimised, UNDECORATED window that
-// covers ≥95% of the target monitor — i.e. a borderless fullscreen surface.
-// Decorated windows (WS_CAPTION/WS_THICKFRAME — a maximised browser, a
-// windowed game) never qualify.
+// Accepts ONLY the window the user is looking at (foreground root), owned
+// by the source PID, top-level, visible, non-minimised, UNDECORATED
+// (borderless), covering ≥99% of the target monitor. 99% — not 95% —
+// because a maximised window with a visible taskbar covers ~97-98% at
+// 2160p and must NOT qualify: borderless fullscreen covers the taskbar
+// region, maximised does not. Decorated windows (WS_CAPTION/WS_THICKFRAME)
+// never qualify. The foreground requirement is what stops a fullscreen game
+// that keeps rendering BEHIND the browser from triggering a drop while the
+// user is working (v1.6.5, observed live).
 static BOOL CALLBACK findBorderlessCb(HWND hwnd, LPARAM lp) {
     auto* ctx = reinterpret_cast<WinCtx*>(lp);
     DWORD pid = 0;
@@ -1185,6 +1198,8 @@ static BOOL CALLBACK findBorderlessCb(HWND hwnd, LPARAM lp) {
     if (GetAncestor(hwnd, GA_ROOT) != hwnd) return TRUE;               // top-level only
     const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
     if (style & (WS_CAPTION | WS_THICKFRAME)) return TRUE;             // decorated
+    if (hwnd != ctx->fgRootOwner && hwnd != ctx->fgRoot)
+        return TRUE;   // not the foreground window — it is running behind something
     if (MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) != ctx->hmon) return TRUE;
 
     RECT wr{}, mr{};
@@ -1198,14 +1213,28 @@ static BOOL CALLBACK findBorderlessCb(HWND hwnd, LPARAM lp) {
     if (iw <= 0 || ih <= 0) return TRUE;
     const LONGLONG cover = static_cast<LONGLONG>(iw) * ih;
     const LONGLONG monA = static_cast<LONGLONG>(r.right - r.left) * (r.bottom - r.top);
-    if (cover * 20 < monA * 19) return TRUE;   // <95% coverage — not fullscreen
+    if (cover * 100 < monA * 99) return TRUE;   // <99% coverage — maximised, not fullscreen
     ctx->found = hwnd;
+    GetClassNameW(hwnd, ctx->cls, static_cast<int>(sizeof(ctx->cls) / sizeof(ctx->cls[0])));
+    ctx->rect = wr;
     return FALSE;   // found — stop enumeration
 }
 
-static bool pidHasBorderlessFullscreenOn(DWORD pid, HMONITOR hmon) {
-    WinCtx ctx{ pid, hmon, nullptr };
+static bool pidHasBorderlessFullscreenOn(DWORD pid, HMONITOR hmon,
+                                         char* clsOut, size_t clsCap,
+                                         RECT* rectOut) {
+    HWND fg = GetForegroundWindow();
+    WinCtx ctx{ pid, hmon,
+                fg ? GetAncestor(fg, GA_ROOTOWNER) : nullptr,
+                fg ? GetAncestor(fg, GA_ROOT) : nullptr,
+                nullptr, L"", RECT{} };
     EnumWindows(findBorderlessCb, reinterpret_cast<LPARAM>(&ctx));
+    if (ctx.found && clsOut && clsCap) {
+        strncpy_s(clsOut, clsCap, "?", _TRUNCATE);
+        WideCharToMultiByte(CP_UTF8, 0, ctx.cls, -1, clsOut,
+                            static_cast<int>(clsCap), nullptr, nullptr);
+        if (rectOut) *rectOut = ctx.rect;
+    }
     return ctx.found != nullptr;
 }
 
@@ -1855,10 +1884,16 @@ static void resTick(int util, int fg) {
         if (!hmon) { g_res.hotSince = now; return; }
         const int srcMin = std::min(GFX_SRC_MIN_PCT, onPct / 2);
         DWORD srcPid = 0; int srcPct = 0;
+        char srcCls[64] = "?"; RECT srcRect{};
         for (const auto& pu : per) {
             if (pu.pct < srcMin) break;   // sorted desc — the rest is noise
-            if (!pidHasBorderlessFullscreenOn(pu.pid, hmon)) continue;
+            char cls[64] = "?";
+            RECT wr{};
+            if (!pidHasBorderlessFullscreenOn(pu.pid, hmon, cls, sizeof(cls), &wr))
+                continue;
             srcPid = pu.pid; srcPct = pu.pct;
+            strncpy_s(srcCls, cls, _TRUNCATE);
+            srcRect = wr;
             break;
         }
         if (!srcPid) {
@@ -1879,9 +1914,9 @@ static void resTick(int util, int fg) {
                              i ? ", " : "", nm, per[i].pct);
                     strncat_s(tops, piece, _TRUNCATE);
                 }
-                log("res: GPU %d%% but none of the loaded processes (%s) holds"
-                    " a borderless fullscreen on %ls — background compute/"
-                    "render, not a game — not dropping",
+                log("res: GPU %d%% but none of the loaded processes (%s) is"
+                    " the borderless-fullscreen foreground app on %ls —"
+                    " background compute/render, not the played game — not dropping",
                     util, tops, disp->devName);
             }
             g_res.hotSince = now;
@@ -1900,8 +1935,11 @@ static void resTick(int util, int fg) {
         logProcessName(h, exe, sizeof(exe));
 
         log("res[%ls]: GPU %d%% sustained %ds sourced to %s (pid %lu, %d%% gfx,"
-            " borderless fullscreen) → game resolution %dx%d → %dx%d",
+            " borderless fullscreen '%s' %ldx%ld) → game resolution %dx%d → %dx%d",
             disp->devName, util, RES_ON_MS / 1000, exe, srcPid, srcPct,
+            srcCls,
+            (long)(srcRect.right - srcRect.left),
+            (long)(srcRect.bottom - srcRect.top),
             (int)cur.dmPelsWidth, (int)cur.dmPelsHeight, tw, th);
         LONG rc = applyDisplayMode(disp->devName, tw, th);
         if (rc == DISP_CHANGE_SUCCESSFUL) {

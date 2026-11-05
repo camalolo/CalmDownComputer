@@ -55,10 +55,9 @@ reconfigure with the VS generator above.
 
 ## Deployment (production machine)
 
-- Deployed binary: `E:\Apps\CalmDownComputer.exe` (v1.3.0+; the pre-rename
-  `E:\Apps\CalmDownGPU.exe` still exists until the user exits the old
-  instance and deletes it). Deploy:
-  `cmd.exe /c copy /Y <staged exe> "E:\Apps\CalmDownComputer.exe"`, verify
+- Deployed binary: `D:\Apps\CalmDownComputer.exe` since v1.6.5 (was
+  `E:\Apps\` before; user moved the Apps folder). Deploy:
+  `cmd.exe /c copy /Y <staged exe> "D:\Apps\CalmDownComputer.exe"`, verify
   with `certutil -hashfile ... SHA256` on both sides.
 - **NEVER launch the exe from a sandbox shell.** It is
   `requireAdministrator`; shell-launched instances become unkillable
@@ -68,7 +67,7 @@ reconfigure with the VS generator above.
   denied, non-elevated) — task migration is done by the app itself.
 - The running instance locks the exe — user must exit it (tray → Exit)
   before a deploy copy can succeed.
-- Log: `E:\Apps\CalmDownComputer.log` (next to the exe, resolved via
+- Log: `D:\Apps\CalmDownComputer.log` (next to the exe, resolved via
   `GetModuleFileNameW`; `%TEMP%` fallback if the dir is read-only). The first
   line of each session prints the resolved path.
 - Rename migration (v1.3.0): on first startup the new exe deletes the legacy
@@ -176,14 +175,20 @@ settings, making the startup resolution irrelevant:
   target display — NOT strictly the top consumer (observed live: background
   chrome 89% out-ranked the fullscreen game 78%; the window decides, not
   the ranking). Candidacy floor: `min(GFX_SRC_MIN_PCT 15%, onPct/2)` per
-  PID. `pidHasBorderlessFullscreenOn` requires a visible, undecorated (no
-  WS_CAPTION/WS_THICKFRAME, top-level) window covering ≥95% of the target
-  monitor. No graphics consumer (AI inference!) or no such window
-  (background compute/render, windowed tools) → NO drop, logged once per
-  load period (`srcLogged`, top-3 loaded pids included in the refusal
-  line). Engage guard: target already at/below the game
-  res → no-op (`naLogged`) — TRUE-exclusive fullscreen changes the mode
-  itself and lands here, staying self-managed.
+   PID. `pidHasBorderlessFullscreenOn` (v1.6.5) requires the window to be
+   **the foreground root** (the one the user is looking at — a fullscreen
+   game that keeps rendering BEHIND the browser must not trigger a drop
+   while the user works; observed live), top-level, visible, undecorated
+   (no WS_CAPTION/WS_THICKFRAME), covering ≥99% of the target monitor
+   (99%, not 95%: a maximised window with visible taskbar covers ~97-98%
+   at 2160p). The engage log names the qualifying window class + rect.
+   No graphics consumer (AI inference!) or no qualifying window
+   (background compute/render, windowed tools, or the fullscreen app not
+   being the foreground) → NO drop, logged once per
+   load period (`srcLogged`, top-3 loaded pids included in the refusal
+   line). Engage guard: target already at/below the game
+   res → no-op (`naLogged`) — TRUE-exclusive fullscreen changes the mode
+   itself and lands here, staying self-managed.
 - **Release = source process exit, not quiet** (v1.5.0): at engage a
   `SYNCHRONIZE` process HANDLE is stored; the ONLY restore trigger is
   `WaitForSingleObject(handle, 0)` firing (pid-reuse-proof, immune to game
