@@ -209,9 +209,17 @@ static void logOpen() {
                                 // menu ("Engage at GPU load"), persisted ResOnPct
 #define RES_OFF_PCT       40    // GPU util ≤ this = light load
 #define RES_ON_MS       10000   // heavy load persists this long before the drop
-#define RES_OFF_MS      30000   // all-quiet persists this long before enforcing
+#define RES_OFF_MS      10000   // GPU-quiet persists this long before enforcing
                                 // the desktop resolution (NOT used while
-                                // dropped — the source process owns release)
+                                // dropped — the source process owns release).
+                                // Only GPU noise resets this window; foreground
+                                // reading spikes don't (v1.8.1). At expiry the
+                                // fire still requires a non-gaming foreground
+                                // (RES_OFF_FG_PCT) so windowed games and
+                                // deliberate low-res users don't get fought.
+#define RES_OFF_FG_PCT    30    // foreground % allowed at the moment the
+                                // normalization fires (reading ≈ 0-30, a
+                                // windowed game ≈ 50-100)
 #define GFX_SRC_MIN_PCT   15    // min per-PID graphics util to source a drop
                                 // (floored at onPct/2 so low thresholds still work)
 
@@ -1872,12 +1880,12 @@ static void resTick(int util, int fg) {
     if (!want || util < 0) return;   // off, or no GPU reading: never act blind
 
     const ULONGLONG now = GetTickCount64();
-    // All-quiet (used only while NOT dropped, for desktop normalisation):
-    // low GPU util AND quiet foreground AND total CPU below the busy floor.
-    const bool allQuiet = util <= RES_OFF_PCT &&
-                          fg >= 0 && fg <= FG_OFF_PCT &&
-                          g_shared.cpuUsage >= 0 &&
-                          g_shared.cpuUsage < CPU_USAGE_ON_PCT;
+    // GPU-quiet drives the normalization window; only GPU noise (something
+    // heavy still running) resets it. Foreground spikes are checked at FIRE
+    // time instead — a user reading the desktop must not postpone the
+    // restore (v1.8.1: the old triple-gate reset made restores wait for a
+    // completely still 30s the user never provides).
+    const bool utilQuiet = util <= RES_OFF_PCT;
 
     if (g_res.engaged) {
         // HOLD. The sourced application's lifetime is the only release
@@ -2110,27 +2118,38 @@ static void resTick(int util, int fg) {
 
     // 60s quiet-window telemetry: WHY the 30s normalization window keeps
     // missing is invisible in per-tick lines (they sample every 10th tick).
-    // One line per minute: all-quiet fraction, the maxima that killed it,
-    // and how many times a noisy tick zeroed a running window.
+    // One line per minute: util-quiet fraction, the maxima, and how many
+    // times GPU noise zeroed a running window.
     {
         static int          mxU = -1, mxF = -1, q = 0, tot = 0, rs = 0;
         static ULONGLONG    t0 = 0;
         tot++;
         if (util > mxU) mxU = util;
         if (fg > mxF) mxF = fg;
-        if (allQuiet) q++;
-        else if (g_res.normSince) rs++;   // noisy tick killed a running window
+        if (utilQuiet) q++;
+        else if (g_res.normSince) rs++;   // GPU noise killed a running window
         ULONGLONG n = GetTickCount64();
         if (!t0) t0 = n;
         if (n - t0 >= 60000) {
-            log("resTick: 60s — all-quiet %d/%d ticks, maxUtil=%d%% maxFg=%d%%"
+            log("resTick: 60s — util-quiet %d/%d ticks, maxUtil=%d%% maxFg=%d%%"
                 " cpu=%d%%, window-resets=%d",
                 q, tot, mxU, mxF, g_shared.cpuUsage, rs);
             mxU = -1; mxF = -1; q = 0; tot = 0; rs = 0; t0 = n;
         }
     }
 
-    if (!allQuiet) { g_res.normSince = 0; return; }
+    if (!utilQuiet) { g_res.normSince = 0; return; }
+
+    if (!g_res.normSince) g_res.normSince = now;
+    if (now - g_res.normSince < RES_OFF_MS) return;
+    if (g_res.badDefault || dw <= 0 || dh <= 0) return;
+    // Fire only into a non-gaming foreground: a windowed game (low GPU util,
+    // high foreground CPU) must not get its resolution yanked, and neither
+    // should a user deliberately working at a non-default resolution. The
+    // window stays expired — fire on the first calm tick.
+    if (fg < 0 || fg > RES_OFF_FG_PCT ||
+        g_shared.cpuUsage < 0 || g_shared.cpuUsage >= CPU_USAGE_ON_PCT)
+        return;
 
     // Sustained quiet while not dropped: enforce the configured desktop
     // resolution. This is what makes the startup resolution irrelevant.
