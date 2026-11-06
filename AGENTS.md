@@ -59,6 +59,14 @@ reconfigure with the VS generator above.
   `E:\Apps\` before; user moved the Apps folder). Deploy:
   `cmd.exe /c copy /Y <staged exe> "D:\Apps\CalmDownComputer.exe"`, verify
   with `certutil -hashfile ... SHA256` on both sides.
+- **Self-service restart (v1.8.0, preferred)**: copy the new build to
+  `D:\Apps\CalmDownComputer.new.exe` then run
+  `MSYS_NO_PATHCONV=1 schtasks /run /tn "CalmDown-Restart"` — the elevated
+  task kills the app, moves the staged binary over the live one, and
+  relaunches (bat: `E:\Temp\opencode\restart_calmdown.bat`; recreate the
+  task/bat if Temp was cleaned; creation from the sandbox works with
+  MSYS_NO_PATHCONV=1 — the earlier "access denied" was MSYS flag-mangling).
+  The user only relaunches manually if the task is gone.
 - **NEVER launch the exe from a sandbox shell.** It is
   `requireAdministrator`; shell-launched instances become unkillable
   "UAC-limb zombies" (no log, no tray, ~11MB, stuck). The user double-clicks
