@@ -889,6 +889,11 @@ struct LiveDisplay {
     bool          primary = false;
 };
 
+// Did the last enumDisplays() get names from CCD (1) or fall back to the
+// GDI monitor sub-device (0)? Diagnostics: the worker thread has observed
+// CCD-less enums while the UI thread sees the live truth.
+static volatile LONG g_enumCcdOk = -1;
+
 // All GDI displays currently attached to the desktop. Pure Win32 queries
 // (no subprocess) — cheap enough for every menu rebuild and every governor
 // fire. UI thread uses it for the menu, worker thread for actuation.
@@ -905,6 +910,7 @@ static std::vector<LiveDisplay> enumDisplays() {
     // devName → friendly monitor name, straight from the committed paths.
     std::map<std::wstring, std::wstring> friendly;
     UINT32 nPaths = 0, nModes = 0;
+    bool ccdOk = false;
     if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &nPaths, &nModes) ==
         ERROR_SUCCESS) {
         std::vector<DISPLAYCONFIG_PATH_INFO> paths(nPaths);
@@ -912,6 +918,7 @@ static std::vector<LiveDisplay> enumDisplays() {
         if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &nPaths, paths.data(),
                                &nModes, modes.data(),
                                nullptr) == ERROR_SUCCESS) {
+            ccdOk = true;
             for (UINT32 i = 0; i < nPaths; i++) {
                 DISPLAYCONFIG_SOURCE_DEVICE_NAME src{};
                 src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
@@ -969,6 +976,7 @@ static std::vector<LiveDisplay> enumDisplays() {
         if (d.primary) d.label += L" · primary";
         out.push_back(std::move(d));
     }
+    InterlockedExchange(&g_enumCcdOk, ccdOk ? 1 : 0);
     return out;
 }
 
@@ -1000,6 +1008,10 @@ static const LiveDisplay* resolveDisplay(const wchar_t* pinned,
                                          std::vector<LiveDisplay>& scratch) {
     scratch = enumDisplays();
     if (pinned && pinned[0]) {
+        // Priority: CCD friendly name (the current pin format), then exact
+        // EDID identity, the MONITOR\<pnp> prefix, then legacy GDI names.
+        for (const auto& d : scratch)
+            if (_wcsicmp(d.shortName.c_str(), pinned) == 0) return &d;
         const LiveDisplay* prefixHit = nullptr;
         const LiveDisplay* legacyHit = nullptr;
         wchar_t code[64] = L"MONITOR\\";
@@ -1806,6 +1818,15 @@ static void resTick(int util, int fg) {
     const int dw    = g_shared.resDefaultW, dh   = g_shared.resDefaultH;
     const int onPct = g_shared.resOnPct;   // engage threshold (user-tunable)
 
+    // One-time visibility: if the governor ever sits silent, this line says
+    // whether util/fg were even valid when it was supposed to act.
+    static bool firstLogged = false;
+    if (!firstLogged) {
+        firstLogged = true;
+        log("resTick: first pass — want=%d util=%d fg=%d cpu=%d pin='%ls'",
+            want, util, fg, g_shared.cpuUsage, g_shared.resDisp);
+    }
+
     // Reconcile against the UI's settings (mirrors cpuTick's mode handling).
     if (want != g_res.want || tw != g_res.lastW || th != g_res.lastH ||
         dw != g_res.lastDefW || dh != g_res.lastDefH) {
@@ -2086,6 +2107,29 @@ static void resTick(int util, int fg) {
     g_res.hotSince = 0;
     g_res.naLogged = false;
     g_res.srcLogged = false;
+
+    // 60s quiet-window telemetry: WHY the 30s normalization window keeps
+    // missing is invisible in per-tick lines (they sample every 10th tick).
+    // One line per minute: all-quiet fraction, the maxima that killed it,
+    // and how many times a noisy tick zeroed a running window.
+    {
+        static int          mxU = -1, mxF = -1, q = 0, tot = 0, rs = 0;
+        static ULONGLONG    t0 = 0;
+        tot++;
+        if (util > mxU) mxU = util;
+        if (fg > mxF) mxF = fg;
+        if (allQuiet) q++;
+        else if (g_res.normSince) rs++;   // noisy tick killed a running window
+        ULONGLONG n = GetTickCount64();
+        if (!t0) t0 = n;
+        if (n - t0 >= 60000) {
+            log("resTick: 60s — all-quiet %d/%d ticks, maxUtil=%d%% maxFg=%d%%"
+                " cpu=%d%%, window-resets=%d",
+                q, tot, mxU, mxF, g_shared.cpuUsage, rs);
+            mxU = -1; mxF = -1; q = 0; tot = 0; rs = 0; t0 = n;
+        }
+    }
+
     if (!allQuiet) { g_res.normSince = 0; return; }
 
     // Sustained quiet while not dropped: enforce the configured desktop
@@ -2099,11 +2143,21 @@ static void resTick(int util, int fg) {
     if (!disp) {
         if (!g_res.missingLogged) {
             g_res.missingLogged = true;
-            if (g_shared.resDisp[0])
-                log("res: target display %ls not present — desktop-resolution"
-                    " enforcement paused until it reappears", g_shared.resDisp);
-            else
-                log("res: no displays attached — desktop-resolution enforcement paused");
+            if (g_shared.resDisp[0]) {
+                std::wstring seen;
+                for (const auto& d : scratch)
+                    seen += L"[" + d.shortName + L" " +
+                            std::to_wstring((unsigned)d.w) + L"x" +
+                            std::to_wstring((unsigned)d.h) + L"] ";
+                log("res: target display %ls not present — worker sees %u"
+                    " display(s), ccd=%ld: %ls— enforcement paused until it"
+                    " reappears",
+                    g_shared.resDisp, (unsigned)scratch.size(),
+                    g_enumCcdOk, seen.c_str());
+            } else {
+                log("res: no displays attached — desktop-resolution"
+                    " enforcement paused");
+            }
         }
         g_res.normSince = now;
         return;
@@ -2630,10 +2684,11 @@ static DWORD WINAPI workerMain(LPVOID) {
 
 static void onTimerTick() {
     // Snapshot the worker's latest readings.
-    int temp;
+    int temp, util;
     {
         EnterCriticalSection(&g_cs);
         temp = g_shared.temp;
+        util = g_shared.gpuUtil;
         LeaveCriticalSection(&g_cs);
     }
     if (!g_shared.initDone) { log("tick: waiting for GPU discovery"); return; }
@@ -2641,7 +2696,8 @@ static void onTimerTick() {
     g_lastTemp = temp;
     g_ctrl.maxClock = g_shared.maxClock;
     std::string capS = (g_ctrl.capMhz > 0) ? std::to_string(g_ctrl.capMhz) + "MHz" : "none";
-    log("tick: temp=%d target=%d cap=%s", temp, g_ctrl.targetTemp, capS.c_str());
+    log("tick: temp=%d util=%d%% target=%d cap=%s", temp, util,
+        g_ctrl.targetTemp, capS.c_str());
 
     // Apply the worker's confirmed clock-cap result.
     int done;
