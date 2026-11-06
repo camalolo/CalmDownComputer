@@ -866,9 +866,15 @@ static std::wstring friendlyMonitorName(const wchar_t* edid,
                                         const wchar_t* fallback) {
     if (wcsncmp(edid, L"MONITOR\\", 8) == 0) {
         const wchar_t* code = edid + 8;
+        const wchar_t* slash = wcschr(code, L'\\');   // model code = up to next '\'
+        size_t n = slash ? (size_t)(slash - code) : wcslen(code);
+        if (n > 16) n = 16;
+        wchar_t model[24];
+        wcsncpy_s(model, code, n);
         for (const auto& v : g_vendors)
             if (_wcsnicmp(code, v.code, 3) == 0)
-                return std::wstring(v.name) + L" " + code;
+                return std::wstring(v.name) + L" " + model;
+        return model;   // unknown vendor — the bare model code
     }
     return fallback;   // EDID-less (or unknown) — the adapter/monitor string
 }
@@ -2805,7 +2811,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         std::wstring list;
         for (const auto& d : all) {
             wchar_t one[160];
-            swprintf_s(one, L"%ls · %ux%u%s | ", d.label.c_str(),
+            swprintf_s(one, L"%ls · %ux%u%s | ", d.shortName.c_str(),
                        (unsigned)d.w, (unsigned)d.h,
                        d.primary ? L" [primary]" : L"");
             list += one;
