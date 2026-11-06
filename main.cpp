@@ -2863,6 +2863,22 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         }
         if (list.empty()) log("res: no displays attached");
         else              log("res: displays: %ls", list.c_str());
+
+        // And warn immediately when a pin resolves to nothing — otherwise a
+        // dangling pin sits silent until the first engage attempt.
+        EnterCriticalSection(&g_cs);
+        wchar_t pin[128];
+        wcsncpy_s(pin, g_shared.resDisp, _TRUNCATE);
+        LeaveCriticalSection(&g_cs);
+        if (pin[0]) {
+            bool found = false;
+            for (const auto& d : all)
+                if (displayMatchesPinned(d, pin)) { found = true; break; }
+            if (!found)
+                log("res: pinned target %ls not present right now — governor"
+                    " idle until it appears (re-pick in the menu if renamed)",
+                    pin);
+        }
     }
     // Desktop (rest) resolution: learned once from the target display's
     // Windows-default mode, then owned as a setting like everything else.

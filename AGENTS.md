@@ -155,16 +155,19 @@ is never touched. Menu: `IDM_CPU_AUTO`/`IDM_CPU_OFF`, persisted as
 **Resolution governor (`resTick`)**, ~1/s on the worker thread, opt-in
 (default OFF — a sudden display switch is surprising). This box has VIRTUAL
 displays (streaming driver; the GDI "primary" is one), so it targets a
-USER-SELECTED display: `ResDisp` (REG_SZ = the monitor's EDID identity,
-e.g. `MONITOR\ACR0631\{...}\0008` — picked from a live `enumDisplays()`
-menu snapshot; empty/absent = auto = largest current display — the real
-4K monitor, never the virtual ones). EDID pinning (v1.7.2) replaced the
-old GDI-name pin: `\\.\DISPLAYn` renumbers across reboots/topology churn,
-EDID identities don't. Matching: exact device ID, then the `MONITOR\<pnp>`
-prefix (the trailing instance index drifts when a monitor moves outputs),
-then legacy GDI names (one-time migration rewrites old pins at startup).
-Menu labels are user-friendly ("Acer ACR0631 · 3840x2160 · primary",
-vendor codes mapped via `g_vendors`). OWNERSHIP model — while enabled,
+USER-SELECTED display: `ResDisp` (REG_SZ = the monitor's CCD friendly name,
+e.g. `Acer ET322QK` — the panel's EDID product name, picked from a live
+`enumDisplays()` menu snapshot; empty/absent = auto = largest current display
+— the real 4K monitor, never the virtual ones). Pin format history: GDI names
+(v1.4) → EDID device identities (v1.7.2) → **CCD friendly names (v1.7.5,
+current)**. Identity comes from `QueryDisplayConfig`/`DisplayConfigGetDeviceInfo`
+(dxgkrnl's own topology — the same source NVIDIA Control Panel reads), because
+the GDI monitor sub-device proved untrustworthy on this machine (see Gotchas).
+Matching (v1.7.5+): CCD friendly name first, then EDID device ID, then the
+`MONITOR\<pnp>` prefix, then legacy GDI names — old pins still resolve except
+`MONITOR\...`-format ones, which are retired to auto at startup (they read the
+poisoned layer). Menu labels are user-friendly ("Acer ET322QK · 3840x2160 ·
+primary"). OWNERSHIP model — while enabled,
 BOTH ends come from settings, making the startup resolution irrelevant:
 - **Source-gated engage**: `utilization.gpu` ≥`ResOnPct` (menu-configurable
   "Engage at GPU load" — 25/50/66/75/90%, default 66%, persisted
@@ -312,6 +315,19 @@ Key plumbing:
 - **`runHidden` cannot run `&&`** — it is CreateProcess, not a shell. Multi-
   step commands (powercfg set + setactive) must be separate `runHidden`
   calls.
+- **The GDI monitor sub-device lies on this machine (v1.7.5 lesson)**: a
+  stale monitor devnode (SNY7105, "SONY TV") survived driver restarts,
+  PnP uninstalls, and reboots, and `EnumDisplayDevicesW`'s monitor entry
+  kept serving its cached EDID/model name for the desktop's display —
+  while the CCD topology (`QueryDisplayConfig`, what NVIDIA Control Panel
+  reads) always reported the live truth (Acer ET322QK on DisplayPort).
+  Two full days were spent chasing EDIDs before a `ccdump`-style probe
+  settled it: the layers disagree, CCD wins. NEVER reintroduce GDI
+  monitor data as an identity/name source; `enumDisplays()` takes names
+  from `DisplayConfigGetDeviceInfo` (fallback: the old naming). Also:
+  `QueryDisplayConfig`/GDI are inaccessible from sandbox-spawned shells
+  (window-station isolation) — build a small exe and have the user run
+  it when a ground-truth dump is needed.
 - **powercfg `/query` output leads with "Possible Settings" bounds**
   (`0x00000000`/`0x64`/`1`) BEFORE the index lines — parse the LAST two `0x`
   tokens (AC, then DC; DC prints even on desktops), never the first.
