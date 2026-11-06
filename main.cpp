@@ -77,6 +77,7 @@
 #include <ctime>
 #include <cstdarg>
 #include <mutex>
+#include <map>
 
 // ───────────────────────── Logging ─────────────────────────
 
@@ -881,9 +882,9 @@ static std::wstring friendlyMonitorName(const wchar_t* edid,
 
 struct LiveDisplay {
     wchar_t       devName[32];   // "\\.\DISPLAY2" — the ChangeDisplaySettingsExW handle
-    wchar_t       edid[128];     // MONITOR\<pnp id>\{...}\<inst> — the stable pin
+    wchar_t       edid[128];     // MONITOR\<pnp id>\{...}\<inst> — diagnostics only now
     std::wstring  label;         // menu text, user-friendly
-    std::wstring  shortName;     // for "Target display (…)" — friendly, no mode
+    std::wstring  shortName;     // friendly model name — ALSO the stable pin
     DWORD         w = 0, h = 0;  // current mode
     bool          primary = false;
 };
@@ -891,8 +892,49 @@ struct LiveDisplay {
 // All GDI displays currently attached to the desktop. Pure Win32 queries
 // (no subprocess) — cheap enough for every menu rebuild and every governor
 // fire. UI thread uses it for the menu, worker thread for actuation.
+//
+// Names come from the CCD layer (QueryDisplayConfig — dxgkrnl's own topology,
+// the same source NVIDIA Control Panel reads), NOT from the GDI monitor
+// sub-device: on this machine a stale monitor node survives reboots and serves
+// the wrong model name through EnumDisplayDevices, while CCD always reports
+// the live truth. The CCD friendly name doubles as the pin identity: it is
+// the panel's EDID product name, stable across renumbering and topology churn.
 static std::vector<LiveDisplay> enumDisplays() {
     std::vector<LiveDisplay> out;
+
+    // devName → friendly monitor name, straight from the committed paths.
+    std::map<std::wstring, std::wstring> friendly;
+    UINT32 nPaths = 0, nModes = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &nPaths, &nModes) ==
+        ERROR_SUCCESS) {
+        std::vector<DISPLAYCONFIG_PATH_INFO> paths(nPaths);
+        std::vector<DISPLAYCONFIG_MODE_INFO> modes(nModes);
+        if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &nPaths, paths.data(),
+                               &nModes, modes.data(),
+                               nullptr) == ERROR_SUCCESS) {
+            for (UINT32 i = 0; i < nPaths; i++) {
+                DISPLAYCONFIG_SOURCE_DEVICE_NAME src{};
+                src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+                src.header.size = sizeof(src);
+                src.header.adapterId = paths[i].sourceInfo.adapterId;
+                src.header.id        = paths[i].sourceInfo.id;
+                DISPLAYCONFIG_TARGET_DEVICE_NAME tgt{};
+                tgt.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+                tgt.header.size = sizeof(tgt);
+                tgt.header.adapterId = paths[i].targetInfo.adapterId;
+                tgt.header.id        = paths[i].targetInfo.id;
+                if (DisplayConfigGetDeviceInfo(&src.header) != ERROR_SUCCESS ||
+                    DisplayConfigGetDeviceInfo(&tgt.header) != ERROR_SUCCESS)
+                    continue;
+                if (tgt.monitorFriendlyDeviceName[0] &&
+                    wcscmp(tgt.monitorFriendlyDeviceName,
+                           L"Generic PnP Monitor") != 0)
+                    friendly[src.viewGdiDeviceName] =
+                        tgt.monitorFriendlyDeviceName;
+            }
+        }
+    }
+
     DISPLAY_DEVICEW dd{};
     for (DWORD i = 0;; i++) {
         dd.cb = sizeof(dd);
@@ -908,8 +950,8 @@ static std::vector<LiveDisplay> enumDisplays() {
         d.h = dm.dmPelsHeight;
         d.primary = (dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0;
 
-        // Monitor sub-device: EDID identity + model name (virtual displays
-        // have no meaningful monitor entry — fall back to the adapter).
+        // Monitor sub-device: kept for diagnostics (d.edid) and as the naming
+        // fallback when CCD came up empty (e.g. topology mid-transition).
         DISPLAY_DEVICEW mon{};
         mon.cb = sizeof(mon);
         const wchar_t* who = dd.DeviceString;
@@ -918,7 +960,9 @@ static std::vector<LiveDisplay> enumDisplays() {
             who = mon.DeviceString;
         wcsncpy_s(d.edid, mon.DeviceID[0] ? mon.DeviceID : dd.DeviceName, _TRUNCATE);
 
-        d.shortName = friendlyMonitorName(d.edid, who);
+        auto it = friendly.find(d.devName);
+        d.shortName = (it != friendly.end()) ? it->second
+                                             : friendlyMonitorName(d.edid, who);
         wchar_t res[48];
         swprintf_s(res, L" · %ux%u", (unsigned)d.w, (unsigned)d.h);
         d.label = d.shortName + res;
@@ -928,11 +972,13 @@ static std::vector<LiveDisplay> enumDisplays() {
     return out;
 }
 
-// Does this display match the pinned identity? Exact EDID device ID first,
-// then the MONITOR\<pnp> prefix (the trailing instance index can drift when
-// the monitor moves to another output), then the legacy GDI name.
+// Does this display match the pinned identity? The CCD friendly name is the
+// pin (the panel's EDID product name — stable across renumbering). Older pin
+// formats still resolve: the EDID device ID, its MONITOR\<pnp> prefix, and
+// the legacy GDI name.
 static bool displayMatchesPinned(const LiveDisplay& d, const wchar_t* pinned) {
     if (!pinned || !pinned[0]) return false;
+    if (_wcsicmp(d.shortName.c_str(), pinned) == 0) return true;
     if (wcscmp(d.edid, pinned) == 0) return true;
     if (wcsncmp(pinned, L"MONITOR\\", 8) == 0) {
         wchar_t code[64] = L"MONITOR\\";
@@ -2714,14 +2760,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             size_t idx = id - IDM_RES_DISP_BASE;
             if (idx < g_menuDisplays.size()) {
                 const auto& d = g_menuDisplays[idx];
-                // Pin by EDID identity (stable across renumbering); fall
-                // back to the GDI name only for EDID-less oddities.
-                const wchar_t* idStr = d.edid[0] ? d.edid : d.devName;
+                // Pin by the CCD friendly name (the panel's EDID product name
+                // — stable and human-readable); fall back to the GDI name
+                // only for nameless oddities.
+                std::wstring idStr = d.shortName.empty() ? std::wstring(d.devName)
+                                                         : d.shortName;
                 EnterCriticalSection(&g_cs);
-                wcsncpy_s(g_shared.resDisp, idStr, _TRUNCATE);
+                wcsncpy_s(g_shared.resDisp, idStr.c_str(), _TRUNCATE);
                 LeaveCriticalSection(&g_cs);
-                saveResDisp(idStr);
-                log("menu: target display → %ls (%ls)", d.shortName.c_str(), idStr);
+                saveResDisp(idStr.c_str());
+                log("menu: target display → %ls", idStr.c_str());
             }
             return 0;
         }
@@ -2785,25 +2833,22 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     g_shared.resOnPct   = loadResOnPct();
     // Pinned target display; empty = auto (largest current display — on
     // this machine the real monitor, never the virtual streaming ones).
-    // Legacy pins stored as GDI names ("\\.\DISPLAY1") are migrated once to
-    // EDID identities (stable across renumbering/topology churn).
+    // Pins are CCD friendly names; legacy formats still resolve, EXCEPT the
+    // MONITOR\<pnp>\{guid} EDID-identity format: it read the GDI monitor
+    // sub-device, which served a stale node here (wrong model after display
+    // churn). Retire those to auto — the user re-picks in the menu.
     {
         std::wstring disp = loadResDisp();
+        if (wcsncmp(disp.c_str(), L"MONITOR\\", 8) == 0) {
+            log("res: retiring EDID-format pin (%ls) — read from the unreliable"
+                " GDI monitor node; re-pick Target display in the menu",
+                disp.c_str());
+            disp.clear();
+            saveResDisp(L"");
+        }
         EnterCriticalSection(&g_cs);
         wcsncpy_s(g_shared.resDisp, disp.c_str(), _TRUNCATE);
         LeaveCriticalSection(&g_cs);
-        if (wcsncmp(g_shared.resDisp, L"\\\\.\\", 4) == 0) {
-            std::vector<LiveDisplay> scratch;
-            const LiveDisplay* d = resolveDisplay(g_shared.resDisp, scratch);
-            if (d && d->edid[0]) {
-                EnterCriticalSection(&g_cs);
-                wcsncpy_s(g_shared.resDisp, d->edid, _TRUNCATE);
-                LeaveCriticalSection(&g_cs);
-                saveResDisp(d->edid);
-                log("res: pinned display migrated to EDID identity (%ls -> %ls)",
-                    disp.c_str(), d->shortName.c_str());
-            }
-        }
     }
     // One ground-truth dump per session: what the app actually enumerates.
     {
