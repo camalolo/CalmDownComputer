@@ -846,13 +846,38 @@ static int loadResOnPct() {
 }
 
 // ───────────────────── Displays & mode switching ─────────────────────
-// This machine has REAL monitors AND virtual ones (a streaming driver; the
-// GDI "primary" is virtual) — so the governor targets a USER-SELECTED
-// display by GDI device name, never just "the primary".
+// This machine has REAL monitors AND virtual ones (a streaming driver) — so
+// the governor targets a USER-SELECTED display, pinned by its EDID identity
+// (the monitor's PnP device ID, e.g. MONITOR\ACR0631\{...}\0008). GDI names
+// (\\.\DISPLAYn) are NOT stable: they follow path order and re-number across
+// reboots and topology churn (TVs and virtual displays dropping off the bus
+// reflow everything). EDID identities survive all of that.
+
+// Friendly vendor names for the 3-letter PnP-ID prefixes (ACR0631 → Acer).
+struct Ven { const wchar_t* code; const wchar_t* name; };
+static const Ven g_vendors[] = {
+    { L"ACR", L"Acer" },   { L"SNY", L"Sony" },   { L"DEL", L"Dell" },
+    { L"SAM", L"Samsung" },{ L"BNQ", L"BenQ" },   { L"AOC", L"AOC" },
+    { L"PHL", L"Philips" },{ L"HPN", L"HP" },     { L"GSM", L"LG" },
+    { L"LGD", L"LG" },     { L"MSI", L"MSI" },    { L"MTT", L"Virtual Display" },
+};
+
+static std::wstring friendlyMonitorName(const wchar_t* edid,
+                                        const wchar_t* fallback) {
+    if (wcsncmp(edid, L"MONITOR\\", 8) == 0) {
+        const wchar_t* code = edid + 8;
+        for (const auto& v : g_vendors)
+            if (_wcsnicmp(code, v.code, 3) == 0)
+                return std::wstring(v.name) + L" " + code;
+    }
+    return fallback;   // EDID-less (or unknown) — the adapter/monitor string
+}
 
 struct LiveDisplay {
     wchar_t       devName[32];   // "\\.\DISPLAY2" — the ChangeDisplaySettingsExW handle
-    std::wstring  label;         // menu text: DISPLAYn · monitor/adapter · mode
+    wchar_t       edid[128];     // MONITOR\<pnp id>\{...}\<inst> — the stable pin
+    std::wstring  label;         // menu text, user-friendly
+    std::wstring  shortName;     // for "Target display (…)" — friendly, no mode
     DWORD         w = 0, h = 0;  // current mode
     bool          primary = false;
 };
@@ -877,22 +902,42 @@ static std::vector<LiveDisplay> enumDisplays() {
         d.h = dm.dmPelsHeight;
         d.primary = (dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0;
 
-        // Prefer the monitor's model name; virtual displays have no
-        // meaningful monitor entry — fall back to the adapter string.
+        // Monitor sub-device: EDID identity + model name (virtual displays
+        // have no meaningful monitor entry — fall back to the adapter).
         DISPLAY_DEVICEW mon{};
         mon.cb = sizeof(mon);
         const wchar_t* who = dd.DeviceString;
         if (EnumDisplayDevicesW(dd.DeviceName, 0, &mon, 0) && mon.DeviceString[0] &&
             wcscmp(mon.DeviceString, L"Generic PnP Monitor") != 0)
             who = mon.DeviceString;
+        wcsncpy_s(d.edid, mon.DeviceID[0] ? mon.DeviceID : dd.DeviceName, _TRUNCATE);
 
+        d.shortName = friendlyMonitorName(d.edid, who);
         wchar_t res[48];
         swprintf_s(res, L" · %ux%u", (unsigned)d.w, (unsigned)d.h);
-        d.label = std::wstring(d.devName + 4) + L" · " + who + res;   // skip "\\.\"
+        d.label = d.shortName + res;
         if (d.primary) d.label += L" · primary";
         out.push_back(std::move(d));
     }
     return out;
+}
+
+// Does this display match the pinned identity? Exact EDID device ID first,
+// then the MONITOR\<pnp> prefix (the trailing instance index can drift when
+// the monitor moves to another output), then the legacy GDI name.
+static bool displayMatchesPinned(const LiveDisplay& d, const wchar_t* pinned) {
+    if (!pinned || !pinned[0]) return false;
+    if (wcscmp(d.edid, pinned) == 0) return true;
+    if (wcsncmp(pinned, L"MONITOR\\", 8) == 0) {
+        wchar_t code[64] = L"MONITOR\\";
+        const wchar_t* rest = pinned + 8;
+        const wchar_t* slash = wcschr(rest, L'\\');
+        size_t n = slash ? (size_t)(slash - rest) : wcslen(rest);
+        if (n >= 60) n = 60;
+        wcsncpy_s(code + 8, 56, rest, n);
+        if (_wcsnicmp(d.edid, code, wcslen(code)) == 0) return true;
+    }
+    return _wcsicmp(d.devName, pinned) == 0;   // legacy GDI-name pin
 }
 
 // Which display does the governor act on? A pinned selection wins; with no
@@ -903,8 +948,25 @@ static const LiveDisplay* resolveDisplay(const wchar_t* pinned,
                                          std::vector<LiveDisplay>& scratch) {
     scratch = enumDisplays();
     if (pinned && pinned[0]) {
-        for (const auto& d : scratch)
-            if (wcscmp(d.devName, pinned) == 0) return &d;
+        const LiveDisplay* prefixHit = nullptr;
+        const LiveDisplay* legacyHit = nullptr;
+        wchar_t code[64] = L"MONITOR\\";
+        if (wcsncmp(pinned, L"MONITOR\\", 8) == 0) {
+            const wchar_t* rest = pinned + 8;
+            const wchar_t* slash = wcschr(rest, L'\\');
+            size_t n = slash ? (size_t)(slash - rest) : wcslen(rest);
+            if (n >= 56) n = 56;
+            wcsncpy_s(code + 8, 56, rest, n);
+        }
+        for (const auto& d : scratch) {
+            if (wcscmp(d.edid, pinned) == 0) return &d;         // exact EDID
+            if (!prefixHit && wcsncmp(pinned, L"MONITOR\\", 8) == 0 &&
+                _wcsnicmp(d.edid, code, wcslen(code)) == 0)
+                prefixHit = &d;
+            if (!legacyHit && _wcsicmp(d.devName, pinned) == 0) legacyHit = &d;
+        }
+        if (prefixHit) return prefixHit;
+        if (legacyHit) return legacyHit;
         return nullptr;
     }
     const LiveDisplay* best = nullptr;
@@ -1374,7 +1436,8 @@ struct SharedState {
     volatile int  resDefaultH  = 0;              //   (learned at startup; 0 = unknown)
     volatile int  resOnPct     = RES_ON_PCT;     // UI → worker: engage threshold %
     volatile int  resEngaged   = 0;              // worker → UI: display currently dropped
-    wchar_t       resDisp[32]{};                 // UI → worker: pinned display; empty = auto
+    wchar_t       resDisp[128]{};                // UI → worker: pinned display EDID
+                                                 // identity (or legacy GDI name); "" = auto
     volatile bool initDone     = false;
     volatile bool trayDirty    = false;
     wchar_t       trayTip[128]{};
@@ -2196,15 +2259,20 @@ static void rebuildMenu() {
         AppendMenuW(dispSub, MF_STRING | (!g_shared.resDisp[0] ? MF_CHECKED : 0),
                     IDM_RES_DISP_AUTO, L"Auto (largest display)");
         g_menuDisplays = enumDisplays();
+        const LiveDisplay* pinnedDisp = nullptr;
         for (size_t i = 0; i < g_menuDisplays.size() && i < 16; i++) {
             const auto& d = g_menuDisplays[i];
             UINT flags = MF_STRING;
-            if (g_shared.resDisp[0] && wcscmp(g_shared.resDisp, d.devName) == 0)
+            if (g_shared.resDisp[0] && displayMatchesPinned(d, g_shared.resDisp)) {
                 flags |= MF_CHECKED;
+                pinnedDisp = &d;
+            }
             AppendMenuW(dispSub, flags, IDM_RES_DISP_BASE + (UINT)i, d.label.c_str());
         }
-        if (g_shared.resDisp[0])
-            swprintf_s(lbl, L"Target display (%ls)", g_shared.resDisp);
+        if (pinnedDisp)
+            swprintf_s(lbl, L"Target display (%ls)", pinnedDisp->shortName.c_str());
+        else if (g_shared.resDisp[0])
+            swprintf_s(lbl, L"Target display (pinned, not present)");
         else
             swprintf_s(lbl, L"Target display (auto)");
         AppendMenuW(g_hMenu, MF_POPUP, (UINT_PTR)dispSub, lbl);
@@ -2640,11 +2708,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             size_t idx = id - IDM_RES_DISP_BASE;
             if (idx < g_menuDisplays.size()) {
                 const auto& d = g_menuDisplays[idx];
+                // Pin by EDID identity (stable across renumbering); fall
+                // back to the GDI name only for EDID-less oddities.
+                const wchar_t* idStr = d.edid[0] ? d.edid : d.devName;
                 EnterCriticalSection(&g_cs);
-                wcsncpy_s(g_shared.resDisp, d.devName, _TRUNCATE);
+                wcsncpy_s(g_shared.resDisp, idStr, _TRUNCATE);
                 LeaveCriticalSection(&g_cs);
-                saveResDisp(d.devName);
-                log("menu: target display → %ls", d.devName);
+                saveResDisp(idStr);
+                log("menu: target display → %ls (%ls)", d.shortName.c_str(), idStr);
             }
             return 0;
         }
@@ -2708,11 +2779,25 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     g_shared.resOnPct   = loadResOnPct();
     // Pinned target display; empty = auto (largest current display — on
     // this machine the real monitor, never the virtual streaming ones).
+    // Legacy pins stored as GDI names ("\\.\DISPLAY1") are migrated once to
+    // EDID identities (stable across renumbering/topology churn).
     {
         std::wstring disp = loadResDisp();
         EnterCriticalSection(&g_cs);
         wcsncpy_s(g_shared.resDisp, disp.c_str(), _TRUNCATE);
         LeaveCriticalSection(&g_cs);
+        if (wcsncmp(g_shared.resDisp, L"\\\\.\\", 4) == 0) {
+            std::vector<LiveDisplay> scratch;
+            const LiveDisplay* d = resolveDisplay(g_shared.resDisp, scratch);
+            if (d && d->edid[0]) {
+                EnterCriticalSection(&g_cs);
+                wcsncpy_s(g_shared.resDisp, d->edid, _TRUNCATE);
+                LeaveCriticalSection(&g_cs);
+                saveResDisp(d->edid);
+                log("res: pinned display migrated to EDID identity (%ls -> %ls)",
+                    disp.c_str(), d->edid);
+            }
+        }
     }
     // Desktop (rest) resolution: learned once from the target display's
     // Windows-default mode, then owned as a setting like everything else.

@@ -155,11 +155,17 @@ is never touched. Menu: `IDM_CPU_AUTO`/`IDM_CPU_OFF`, persisted as
 **Resolution governor (`resTick`)**, ~1/s on the worker thread, opt-in
 (default OFF — a sudden display switch is surprising). This box has VIRTUAL
 displays (streaming driver; the GDI "primary" is one), so it targets a
-USER-SELECTED display: `ResDisp` (REG_SZ = GDI device name like
-`\\.\DISPLAY2`, picked from a live `enumDisplays()` menu snapshot;
-empty/absent = auto = largest current display — the real 4K monitor, never
-the virtual ones). OWNERSHIP model — while enabled, BOTH ends come from
-settings, making the startup resolution irrelevant:
+USER-SELECTED display: `ResDisp` (REG_SZ = the monitor's EDID identity,
+e.g. `MONITOR\ACR0631\{...}\0008` — picked from a live `enumDisplays()`
+menu snapshot; empty/absent = auto = largest current display — the real
+4K monitor, never the virtual ones). EDID pinning (v1.7.2) replaced the
+old GDI-name pin: `\\.\DISPLAYn` renumbers across reboots/topology churn,
+EDID identities don't. Matching: exact device ID, then the `MONITOR\<pnp>`
+prefix (the trailing instance index drifts when a monitor moves outputs),
+then legacy GDI names (one-time migration rewrites old pins at startup).
+Menu labels are user-friendly ("Acer ACR0631 · 3840x2160 · primary",
+vendor codes mapped via `g_vendors`). OWNERSHIP model — while enabled,
+BOTH ends come from settings, making the startup resolution irrelevant:
 - **Source-gated engage**: `utilization.gpu` ≥`ResOnPct` (menu-configurable
   "Engage at GPU load" — 25/50/66/75/90%, default 66%, persisted
   `ResOnPct`) sustained `RES_ON_MS` 10s is only the CANDIDATE condition. The
