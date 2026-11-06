@@ -2795,9 +2795,23 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
                 LeaveCriticalSection(&g_cs);
                 saveResDisp(d->edid);
                 log("res: pinned display migrated to EDID identity (%ls -> %ls)",
-                    disp.c_str(), d->edid);
+                    disp.c_str(), d->shortName.c_str());
             }
         }
+    }
+    // One ground-truth dump per session: what the app actually enumerates.
+    {
+        std::vector<LiveDisplay> all = enumDisplays();
+        std::wstring list;
+        for (const auto& d : all) {
+            wchar_t one[160];
+            swprintf_s(one, L"%ls · %ux%u%s | ", d.label.c_str(),
+                       (unsigned)d.w, (unsigned)d.h,
+                       d.primary ? L" [primary]" : L"");
+            list += one;
+        }
+        if (list.empty()) log("res: no displays attached");
+        else              log("res: displays: %ls", list.c_str());
     }
     // Desktop (rest) resolution: learned once from the target display's
     // Windows-default mode, then owned as a setting like everything else.
