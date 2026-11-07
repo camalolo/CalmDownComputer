@@ -1714,6 +1714,30 @@ static bool restoreToDefault(const LiveDisplay* disp) {
     return restoreDisplayMode(disp->devName);
 }
 
+// Persist the CURRENT committed topology as the OS display database default
+// — the same mechanism Monitor Profile Switcher uses (SetDisplayConfig with
+// SDC_SAVE_TO_DATABASE). Re-committing the identical topology changes
+// nothing visually: same modes, same panel timing.
+static bool ccdSaveDatabaseDefault() {
+    UINT32 nPaths = 0, nModes = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &nPaths, &nModes)
+        != ERROR_SUCCESS)
+        return false;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(nPaths);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(nModes);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &nPaths, paths.data(),
+                           &nModes, modes.data(), nullptr) != ERROR_SUCCESS)
+        return false;
+    LONG rc = SetDisplayConfig(nPaths, paths.data(), nModes, modes.data(),
+                               SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG |
+                               SDC_SAVE_TO_DATABASE);
+    if (rc != ERROR_SUCCESS)
+        rc = SetDisplayConfig(nPaths, paths.data(), nModes, modes.data(),
+                              SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG |
+                              SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES);
+    return rc == ERROR_SUCCESS;
+}
+
 // Make the OS display database default for this display match the
 // configured desktop resolution WITHOUT touching the current mode
 // (CDS_UPDATEREGISTRY | CDS_NORESET — the documented save-without-apply).
@@ -1747,6 +1771,21 @@ static bool ensureDatabaseDefault(const wchar_t* dev, bool firstCheck) {
                 (unsigned long)reg.dmDisplayFrequency);
         return true;   // already aligned — nothing to write
     }
+    // Persist via the CCD database-save — the mechanism Monitor Profile
+    // Switcher uses (SetDisplayConfig + SDC_SAVE_TO_DATABASE). The legacy
+    // CDS_UPDATEREGISTRY|CDS_NORESET write proved non-persistent on this
+    // machine: every dbSync re-found the stale default (the database kept
+    // reverting overnight). Re-committing the identical topology changes
+    // nothing visually — same modes, same timing.
+    if (ccdSaveDatabaseDefault()) {
+        log("res[%ls]: Windows default mode aligned to the current mode"
+            " %lux%lu @%luHz (database had %lux%lu @%luHz, saved via CCD)",
+            dev, (unsigned long)cur.dmPelsWidth, (unsigned long)cur.dmPelsHeight,
+            (unsigned long)cur.dmDisplayFrequency,
+            (unsigned long)reg.dmPelsWidth, (unsigned long)reg.dmPelsHeight,
+            (unsigned long)reg.dmDisplayFrequency);
+        return true;
+    }
     DEVMODEW dm{};
     if (!findNativeMode(dev, (int)cur.dmPelsWidth, (int)cur.dmPelsHeight, &dm))
         return false;
@@ -1756,7 +1795,7 @@ static bool ensureDatabaseDefault(const wchar_t* dev, bool firstCheck) {
                                              nullptr);
     if (rc == DISP_CHANGE_SUCCESSFUL) {
         log("res[%ls]: Windows default mode aligned to the current mode"
-            " %lux%lu @%luHz (database had %lux%lu @%luHz)",
+            " %lux%lu @%luHz (database had %lux%lu @%luHz, legacy CDS)",
             dev, (unsigned long)cur.dmPelsWidth, (unsigned long)cur.dmPelsHeight,
             (unsigned long)cur.dmDisplayFrequency,
             (unsigned long)reg.dmPelsWidth, (unsigned long)reg.dmPelsHeight,
